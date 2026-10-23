@@ -1,0 +1,19 @@
+[Unit]
+Description=m2ppp answer daemon on /dev/%I
+After=dev-%i.device
+# BindsTo would stop (and thus kill) the daemon the moment the device is
+# unplugged, preventing its in-process reopen loop from ever running.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/m2ppp -d /dev/%I
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+SyslogIdentifier=m2ppp-%i
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
