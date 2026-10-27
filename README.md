@@ -50,7 +50,7 @@ Arguments after `--` are passed through to `pppd`.
 -p path      pppd binary                             (default /usr/sbin/pppd)
 -g path      login program                           (default /bin/login)
 -u user      run pppd as user; if it cannot be changed, quit
--w seconds   PPP frame detection window              (default 30)
+-w seconds   PPP frame detection window              (default 60)
 -P seconds   show login prompt after N sec           (default 6)
 -c seconds   pause before waiting again              (default 0)
 -I minutes   hang up an idle PPP session after N min (default 10)

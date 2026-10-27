@@ -28,7 +28,7 @@
  *   -p path      pppd binary                             (default /usr/sbin/pppd)
  *   -g path      login program for non-PPP calls         (default /bin/login)
  *   -u user      run pppd as user; if it cannot be changed, quit
- *   -w seconds   PPP frame detection window              (default 30)
+ *   -w seconds   PPP frame detection window              (default 60)
  *   -P seconds   show login prompt after N sec           (default 6)
  *   -c seconds   pause before waiting again              (default 0)
  *   -I minutes   hang up an idle PPP session after N min (default 10)
@@ -46,6 +46,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <limits.h>
+#include <paths.h>
 #include <poll.h>
 #include <pwd.h>
 #include <signal.h>
@@ -57,11 +58,13 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <utmpx.h>
 
 /* ------------------------------------------------------------------ */
 /* configuration constants                                            */
@@ -72,7 +75,7 @@
 #define INIT_OK_SECONDS_DEFAULT 2
 #define LOGIN_PROMPT_SECONDS_DEFAULT 6
 #define MODEM_REINIT_SECONDS_DEFAULT 900
-#define PPP_DETECT_SECONDS_DEFAULT 30
+#define PPP_DETECT_SECONDS_DEFAULT 60
 #define PPP_IDLE_MINUTES_DEFAULT 10
 
 /* default option values */
@@ -89,7 +92,9 @@
 #define MAX_PPPD_ARGS 16
 
 #define CHAT_DELAY_US 500000
-#define CONNECT_CAPTURE_SECONDS 2
+#define CHILD_TERM_MS 5000
+#define CONNECT_CAPTURE_MS 2000
+#define POLL_SLICE_MS 1500
 #define ISSUE_FILE "/etc/issue.net"
 
 #define DIGIT_CHARS "0123456789"
@@ -120,7 +125,7 @@
 #define PPP_LCP_PROTO_LOW 0x21
 #define PPP_UNESCAPE(c) ((unsigned char)((c) ^ 0x20))
 
-/* serial_read_char() / serial_wait_input() results */
+/* serial_read_char() results */
 #define SERIAL_TIMEOUT 0
 #define SERIAL_OK 1
 #define SERIAL_ERROR (-1)
@@ -137,6 +142,12 @@
 #define WAIT_RING 1
 #define WAIT_ABORT 2
 #define WAIT_TIMEOUT (-1)
+
+/* detect_type() results (SERIAL_LOST on device loss) */
+#define DETECTED_DROP 0    /* timeout/abort: drop the call        */
+#define DETECTED_PPP 1     /* PPP frame seen: run pppd            */
+#define DETECTED_LOGIN 2   /* login name entered: run the login   */
+#define DETECTED_LOST (-1) /* line lost: reopen                 */
 
 /* termios flow control */
 #define FLOW_NONE 0
@@ -267,55 +278,123 @@ static void reset_call_data(void)
 }
 
 static int serial_fd = -1;
+static pid_t child_pid = -1;
 static char lock_files[MAX_LOCK_FILES][256];
 static int lock_count;
 
 /* ------------------------------------------------------------------ */
-/* signals                                                            */
+/* UUCP-style lock files                                              */
 /* ------------------------------------------------------------------ */
 
-/* forward declarations for the cleanup performed by check_signal() */
-static void tio_hangup(int fd);
-static void lock_remove(void);
-
 /*
- * Signal handling. The handler only records the signal (async-signal-safe);
- * the real work (log, hang up, unlink the lock, exit) is done by
- * check_signal(), which runs in normal context from the blocking loops.
+ * Fill names[] with the UUCP lock file(s) for dev and return the count.
+ * The device-number lock (LOCK_DEVNUM) is alias-safe; the basename lock
+ * (LOCK_BASENAME) follows the UUCP/pppd/mgetty convention. If neither is
+ * available (e.g. LOCK_DEVNUM on a non-character device) the basename is used.
  */
-static void sig_handler(int sig)
+static int lock_names(const char *dev, char names[][256], int max)
 {
-  g_signal = sig;
+  const char *b;
+  int n = 0;
+  struct stat st;
+
+  if ((LOCK_KIND & LOCK_DEVNUM) && n < max && stat(dev, &st) == 0 && S_ISCHR(st.st_mode)) {
+    snprintf(names[n], 256, "%s/LCK..%03u%03u", opt_lockdir, major(st.st_rdev), minor(st.st_rdev));
+    n++;
+  }
+  if (((LOCK_KIND & LOCK_BASENAME) || n == 0) && n < max) {
+    b = strrchr(dev, '/');
+    b = b ? b + 1 : dev;
+    snprintf(names[n], 256, "%s/LCK..%s", opt_lockdir, b);
+    n++;
+  }
+  return n;
 }
 
-static void check_signal(void)
+static int lock_read_pid(const char *name)
 {
-  const char *name = "signal";
-  int sig = g_signal;
+  char buf[32];
+  int fd, pid = 0;
+  ssize_t n;
 
-  if (!sig) return;
-  g_signal = 0;
-
-  if (sig == SIGINT) name = "SIGINT (^C)";
-  else if (sig == SIGTERM) name = "SIGTERM";
-  else if (sig == SIGHUP) name = "SIGHUP";
-
-  step("caught %s, hanging up", name);
-  if (serial_fd >= 0) tio_hangup(serial_fd);
-  lock_remove();
-  _exit(1);
+  fd = open(name, O_RDONLY);
+  if (fd < 0) return 0;
+  n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) return 0;
+  buf[n] = '\0';
+  if (sscanf(buf, "%d", &pid) != 1) return 0;
+  return pid;
 }
 
-/* install a handler that interrupts blocking calls (no SA_RESTART) */
-static void install_signal(int sig)
+/* return pid of a holder of any lock file, or 0 if free (stale ones removed) */
+static int lock_check(const char *dev)
 {
-  struct sigaction sa;
+  char names[MAX_LOCK_FILES][256];
+  int i, n, pid;
+  struct stat st;
 
-  memset(&sa, 0, sizeof(sa));
-  sa.sa_handler = sig_handler;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;
-  sigaction(sig, &sa, NULL);
+  n = lock_names(dev, names, MAX_LOCK_FILES);
+  for (i = 0; i < n; i++) {
+    if (stat(names[i], &st) < 0 && errno == ENOENT) continue;
+
+    pid = lock_read_pid(names[i]);
+    if (pid <= 0) continue;
+    if (pid == getpid()) continue;
+    if (kill(pid, 0) < 0 && errno == ESRCH) {
+      unlink(names[i]);
+      continue;
+    }
+    return pid;
+  }
+  return 0;
+}
+
+static void lock_remove(void)
+{
+  int i;
+
+  if (!lock_count) return;
+  for (i = 0; i < lock_count; i++) unlink(lock_files[i]);
+  lock_count = 0;
+}
+
+static int lock_make(const char *dev)
+{
+  char buf[32];
+  int fd, i, n;
+
+  n = lock_names(dev, lock_files, MAX_LOCK_FILES);
+  snprintf(buf, sizeof(buf), "%10d\n", (int)getpid());
+
+  lock_count = 0;
+  for (i = 0; i < n; i++) {
+    fd = open(lock_files[i], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) {
+      lock_remove();
+      return -1;
+    }
+    lock_count++; /* this file exists now and must be cleaned up */
+    if (write(fd, buf, strlen(buf)) != (ssize_t)strlen(buf)) {
+      close(fd);
+      lock_remove();
+      return -1;
+    }
+    close(fd);
+  }
+  return 0;
+}
+
+/* take the UUCP lock, for the life of the process. 0 on success. */
+static int lock_line(void)
+{
+  step("locking %s", opt_device);
+  if (lock_check(opt_device) != 0 || lock_make(opt_device) != 0) {
+    step("line is locked, giving up");
+    return -1;
+  }
+  step("lock acquired");
+  return 0;
 }
 
 /*
@@ -359,6 +438,7 @@ enum m2ppp_state {
   st_waiting,      /* wait for RING / periodic re-init          */
   st_answer_phone, /* ATA, wait for CONNECT                     */
   st_detect_ppp,   /* watch for the start of a PPP frame        */
+  st_exec_login,   /* run the login program                     */
   st_exec_ppp      /* hand the line to pppd (does not return)   */
 };
 
@@ -464,31 +544,42 @@ static void tio_set_flow_control(struct termios *t, int type)
   }
 }
 
-/* normal getty/login mode: CR/NL mapping, echo, line editing, signals */
+/* normal getty/login-mode termios: CR/NL mapping, echo, editing, signals */
+static void tio_mode_sane_flags(struct termios *t)
+{
+  t->c_iflag |= ICRNL;
+  t->c_iflag &= ~(IGNCR | INLCR | ISTRIP);
+  t->c_oflag |= (OPOST | ONLCR);
+  t->c_lflag |= (ISIG | ICANON | ECHO | ECHOE | ECHOK);
+  t->c_cflag |= (CS8 | CREAD);
+
+  t->c_cc[VINTR] = 0x03;  /* ^C */
+  t->c_cc[VQUIT] = 0x1c;  /* ^\ */
+  t->c_cc[VERASE] = 0x7f; /* DEL */
+  t->c_cc[VKILL] = 0x15;  /* ^U */
+  t->c_cc[VEOF] = 0x04;   /* ^D */
+  t->c_cc[VSTART] = 0x11; /* ^Q */
+  t->c_cc[VSTOP] = 0x13;  /* ^S */
+  t->c_cc[VSUSP] = 0x1a;  /* ^Z */
+  t->c_cc[VMIN] = 1;
+  t->c_cc[VTIME] = 0;
+}
+
+/* set the real line to the sane login mode (carrier-sensitive) */
 static void tio_mode_sane(int fd)
 {
   struct termios t;
+  int status;
 
   if (tio_get(fd, &t) < 0) return;
+  tio_mode_sane_flags(&t);
 
-  t.c_iflag |= ICRNL;
-  t.c_iflag &= ~(IGNCR | INLCR | ISTRIP);
-  t.c_oflag |= (OPOST | ONLCR);
-  t.c_lflag |= (ISIG | ICANON | ECHO | ECHOE | ECHOK);
-  t.c_cflag |= (CS8 | CREAD);
+  /* DCD is logged for diagnostics (carrier-sensitive login: a DCD drop hangs
+   * up the login session) */
+  if (ioctl(fd, TIOCMGET, &status) < 0) step("login: DCD unknown");
+  else step("login: DCD %s", (status & TIOCM_CAR) ? "on" : "off");
   tio_carrier(&t, 1);                  /* carrier-sensitive: a DCD drop hangs up the session */
   tio_set_flow_control(&t, FLOW_SOFT); /* software XON/XOFF; drops the stale CRTSCTS */
-
-  t.c_cc[VINTR] = 0x03;  /* ^C */
-  t.c_cc[VQUIT] = 0x1c;  /* ^\ */
-  t.c_cc[VERASE] = 0x7f; /* DEL */
-  t.c_cc[VKILL] = 0x15;  /* ^U */
-  t.c_cc[VEOF] = 0x04;   /* ^D */
-  t.c_cc[VSTART] = 0x11; /* ^Q */
-  t.c_cc[VSTOP] = 0x13;  /* ^S */
-  t.c_cc[VSUSP] = 0x1a;  /* ^Z */
-  t.c_cc[VMIN] = 1;
-  t.c_cc[VTIME] = 0;
 
   tio_set(fd, &t);
 }
@@ -577,40 +668,80 @@ static void serial_flush_input(int fd)
   tcflush(fd, TCIFLUSH);
 }
 
+/* ------------------------------------------------------------------ */
+/* signals                                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Signal handling. The handler only records the signal (async-signal-safe);
+ * the real work (log, hang up, unlink the lock, exit) is done by
+ * check_signal(), which runs in normal context from the blocking loops.
+ */
+static void sig_handler(int sig)
+{
+  g_signal = sig;
+}
+
+/* terminate and reap the active relay child before exiting */
+static void terminate_child(void)
+{
+  int status;
+  long long deadline;
+  pid_t r;
+
+  if (child_pid <= 0) return;
+
+  kill(child_pid, SIGTERM);
+  deadline = now() + CHILD_TERM_MS;
+  for (;;) {
+    r = waitpid(child_pid, &status, WNOHANG);
+    if (r == child_pid || (r < 0 && errno != EINTR)) break;
+    if (now() >= deadline) {
+      kill(child_pid, SIGKILL);
+      while (waitpid(child_pid, &status, 0) < 0 && errno == EINTR) {
+      }
+      break;
+    }
+    usleep(100000);
+  }
+  child_pid = -1;
+}
+
+/* install a handler that interrupts blocking calls (no SA_RESTART) */
+static void install_signal(int sig)
+{
+  struct sigaction sa;
+
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = sig_handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  sigaction(sig, &sa, NULL);
+}
+
+static void check_signal(void)
+{
+  const char *name = "signal";
+  int sig = g_signal;
+
+  if (!sig) return;
+  g_signal = 0;
+
+  if (sig == SIGINT) name = "SIGINT (^C)";
+  else if (sig == SIGTERM) name = "SIGTERM";
+  else if (sig == SIGHUP) name = "SIGHUP";
+
+  step("caught %s, hanging up", name);
+  if (serial_fd >= 0) tio_hangup(serial_fd);
+  terminate_child();
+  lock_remove();
+  _exit(1);
+}
+
 /* errno values that mean the device/line has gone away */
 static int serial_gone(int err)
 {
   return err == EIO || err == ENXIO || err == ENODEV || err == ECONNRESET || err == EBADF;
-}
-
-/* wait until input is readable on fd, or timeout; SERIAL_LOST if gone */
-static int serial_wait_input(int fd, int timeout_ms)
-{
-  int r, wait;
-  long long end, left;
-  struct pollfd pfd;
-
-  pfd.fd = fd;
-  pfd.events = POLLIN;
-  end = now() + timeout_ms;
-
-  for (;;) {
-    left = end - now();
-    wait = left > INT_MAX ? INT_MAX : (left > 0 ? (int)left : 0);
-
-    r = poll(&pfd, 1, wait);
-    if (r < 0) {
-      if (errno == EINTR) {
-        check_signal();
-        continue;
-      }
-      return SERIAL_ERROR;
-    }
-    if (r == 0) return SERIAL_TIMEOUT;
-    if (pfd.revents & POLLIN) return SERIAL_OK;
-    if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) return SERIAL_LOST;
-    /* spurious wakeup: recompute the remaining time and re-poll */
-  }
 }
 
 /*
@@ -622,126 +753,39 @@ static int serial_wait_input(int fd, int timeout_ms)
  */
 static int serial_read_char(int fd, int timeout_ms, unsigned char *c)
 {
-  int r;
+  struct pollfd pfd = {.fd = fd, .events = POLLIN};
+  long long end = now() + timeout_ms, left;
+  int r, wait;
 
   for (;;) {
-    r = serial_wait_input(fd, timeout_ms);
-    if (r != SERIAL_OK) return r;
+    check_signal();
+    left = end - now();
+    wait = left > POLL_SLICE_MS ? POLL_SLICE_MS : (left > 0 ? (int)left : 0);
 
-    /* the fd is readable: drain one byte */
-    r = (int)read(fd, c, 1);
-    if (r == 1) return SERIAL_OK;
-    if (r == 0) return SERIAL_LOST; /* EOF */
-    if (errno == EINTR) {
-      check_signal();
-      continue;
+    r = poll(&pfd, 1, wait);
+    if (r < 0) {
+      if (errno == EINTR) {
+        check_signal();
+        continue;
+      }
+      return SERIAL_ERROR;
     }
-    if (serial_gone(errno)) return SERIAL_LOST;
-    return SERIAL_ERROR;
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* UUCP-style lock files                                              */
-/* ------------------------------------------------------------------ */
-
-/*
- * Fill names[] with the UUCP lock file(s) for dev and return the count.
- * The device-number lock (LOCK_DEVNUM) is alias-safe; the basename lock
- * (LOCK_BASENAME) follows the UUCP/pppd/mgetty convention. If neither is
- * available (e.g. LOCK_DEVNUM on a non-character device) the basename is used.
- */
-static int lock_names(const char *dev, char names[][256], int max)
-{
-  const char *b;
-  int n = 0;
-  struct stat st;
-
-  if ((LOCK_KIND & LOCK_DEVNUM) && n < max && stat(dev, &st) == 0 && S_ISCHR(st.st_mode)) {
-    snprintf(names[n], 256, "%s/LCK..%03u%03u", opt_lockdir, major(st.st_rdev), minor(st.st_rdev));
-    n++;
-  }
-  if (((LOCK_KIND & LOCK_BASENAME) || n == 0) && n < max) {
-    b = strrchr(dev, '/');
-    b = b ? b + 1 : dev;
-    snprintf(names[n], 256, "%s/LCK..%s", opt_lockdir, b);
-    n++;
-  }
-  return n;
-}
-
-static int lock_read_pid(const char *name)
-{
-  char buf[32];
-  int fd, pid = 0;
-  ssize_t n;
-
-  fd = open(name, O_RDONLY);
-  if (fd < 0) return 0;
-  n = read(fd, buf, sizeof(buf) - 1);
-  close(fd);
-  if (n <= 0) return 0;
-  buf[n] = '\0';
-  if (sscanf(buf, "%d", &pid) != 1) return 0;
-  return pid;
-}
-
-/* return pid of a holder of any lock file, or 0 if free (stale ones removed) */
-static int lock_check(const char *dev)
-{
-  char names[MAX_LOCK_FILES][256];
-  int i, n, pid;
-  struct stat st;
-
-  n = lock_names(dev, names, MAX_LOCK_FILES);
-  for (i = 0; i < n; i++) {
-    if (stat(names[i], &st) < 0 && errno == ENOENT) continue;
-
-    pid = lock_read_pid(names[i]);
-    if (pid <= 0) continue;
-    if (pid == getpid()) continue;
-    if (kill(pid, 0) < 0 && errno == ESRCH) {
-      unlink(names[i]);
-      continue;
+    if (r == 0) return SERIAL_TIMEOUT;
+    if (pfd.revents & POLLIN) {
+      /* the fd is readable: drain one byte */
+      r = (int)read(fd, c, 1);
+      if (r == 1) return SERIAL_OK;
+      if (r == 0) return SERIAL_LOST; /* EOF */
+      if (errno == EINTR) {
+        check_signal();
+        continue;
+      }
+      if (serial_gone(errno)) return SERIAL_LOST;
+      return SERIAL_ERROR;
     }
-    return pid;
+    if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) return SERIAL_LOST;
+    /* spurious wakeup: recompute the remaining time and re-poll */
   }
-  return 0;
-}
-
-static int lock_make(const char *dev)
-{
-  char buf[32];
-  int fd, i, n;
-
-  n = lock_names(dev, lock_files, MAX_LOCK_FILES);
-  snprintf(buf, sizeof(buf), "%10d\n", (int)getpid());
-
-  lock_count = 0;
-  for (i = 0; i < n; i++) {
-    fd = open(lock_files[i], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-    if (fd < 0) {
-      lock_remove();
-      return -1;
-    }
-    lock_count++; /* this file exists now and must be cleaned up */
-    if (write(fd, buf, strlen(buf)) != (ssize_t)strlen(buf)) {
-      close(fd);
-      lock_remove();
-      return -1;
-    }
-    close(fd);
-  }
-  return 0;
-}
-
-static void lock_remove(void)
-{
-  int i;
-
-  if (!lock_count) return;
-  for (i = 0; i < lock_count; i++) unlink(lock_files[i]);
-  lock_count = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -874,7 +918,10 @@ static int write_full(int fd, const void *buf, size_t len)
   while (len) {
     n = write(fd, p, len);
     if (n < 0) {
-      if (errno == EINTR) continue;
+      if (errno == EINTR) {
+        check_signal();
+        continue;
+      }
       return -1;
     }
     if (n == 0) return -1; /* no progress: do not spin forever */
@@ -898,26 +945,21 @@ static void chat_send(int fd, const char *p)
         if (n && write_full(fd, buf, n) < 0) return;
         n = 0;
         usleep(CHAT_DELAY_US);
+        p++;
+        continue;
       }
-      else if (*p == 'c') {
+      if (*p == 'c') {
         no_cr = 1;
-      }
-      else {
-        if (n == sizeof(buf)) {
-          if (write_full(fd, buf, n) < 0) return;
-          n = 0;
-        }
-        buf[n++] = *p;
+        p++;
+        continue;
       }
     }
-    else {
-      if (n == sizeof(buf)) {
-        if (write_full(fd, buf, n) < 0) return;
-        n = 0;
-      }
-      buf[n++] = *p;
+
+    if (n == sizeof(buf)) {
+      if (write_full(fd, buf, n) < 0) return;
+      n = 0;
     }
-    p++;
+    buf[n++] = *p++;
   }
 
   if (!no_cr) {
@@ -1018,7 +1060,7 @@ static int chat_capture_connect(int fd)
 {
   char line[128];
   int binary = 0, r;
-  long long deadline = now() + (long long)CONNECT_CAPTURE_SECONDS * 1000;
+  long long deadline = now() + CONNECT_CAPTURE_MS;
   size_t line_len = 0;
   unsigned char c;
 
@@ -1235,14 +1277,15 @@ static int relay_loop(int modem, int master, int idle_sec)
   pfd[1].events = POLLIN;
 
   for (;;) {
-    timeout = -1;
+    check_signal();
+    timeout = POLL_SLICE_MS;
     if (idle_sec > 0) {
       left = (long long)idle_sec * 1000 - (now() - last_rx);
       if (left <= 0) {
         step("no data for %d minute(s), hanging up", opt_ppp_idle_minutes);
         return relay_idle;
       }
-      timeout = left > 30000 ? 30000 : (int)left; /* re-check at least every 30s */
+      if (left < timeout) timeout = (int)left;
     }
 
     r = poll(pfd, 2, timeout);
@@ -1257,17 +1300,53 @@ static int relay_loop(int modem, int master, int idle_sec)
 
     if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
       n = read(modem, buf, sizeof(buf));
+      if (n < 0 && errno == EINTR) {
+        check_signal();
+        continue;
+      }
       if (n <= 0) return relay_lost;
       last_rx = now();
       if (write_full(master, buf, (size_t)n) < 0) return relay_closed;
     }
     if (pfd[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
       n = read(master, buf, sizeof(buf));
+      if (n < 0 && errno == EINTR) {
+        check_signal();
+        continue;
+      }
       if (n <= 0) return relay_closed;
       last_rx = now();
       if (write_full(modem, buf, (size_t)n) < 0) return relay_lost;
     }
   }
+}
+
+/* reap a child, terminating it first and escalating to SIGKILL if needed */
+static void reap_child(pid_t pid, int *status, int terminate)
+{
+  long long deadline;
+  pid_t r;
+
+  *status = 0;
+  if (!terminate) {
+    while (waitpid(pid, status, 0) < 0 && errno == EINTR) check_signal();
+    return;
+  }
+
+  kill(pid, SIGTERM);
+  deadline = now() + CHILD_TERM_MS;
+  for (;;) {
+    r = waitpid(pid, status, WNOHANG);
+    if (r == pid || (r < 0 && errno != EINTR)) return;
+    if (now() >= deadline) {
+      step("child did not exit, sending SIGKILL");
+      kill(pid, SIGKILL);
+      break;
+    }
+    usleep(100000);
+    check_signal();
+  }
+  while (waitpid(pid, status, 0) < 0 && errno == EINTR) check_signal();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1361,6 +1440,93 @@ static int login_special(int fd, char *name, size_t *len, size_t max, const char
   }
 }
 
+static void create_pty(int *master_out, int *slave_out, char *slave_name, size_t name_len)
+{
+  const char *name;
+  int master, slave;
+  struct termios t;
+
+  master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+  if (master < 0 || grantpt(master) < 0 || unlockpt(master) < 0)
+    die("cannot create pty: %s", strerror(errno));
+  name = ptsname(master);
+  if (name == NULL) die("ptsname failed: %s", strerror(errno));
+  snprintf(slave_name, name_len, "%s", name);
+
+  slave = open(slave_name, O_RDWR | O_NOCTTY | O_CLOEXEC);
+  if (slave < 0) die("cannot open %s: %s", slave_name, strerror(errno));
+  step("pty slave: %s", slave_name);
+  if (tcgetattr(slave, &t) < 0) die("cannot get tty attrs for %s: %s", slave_name, strerror(errno));
+  cfmakeraw(&t);
+  t.c_cflag |= (CLOCAL | CREAD);
+  if (tcsetattr(slave, TCSANOW, &t) < 0)
+    die("cannot configure %s: %s", slave_name, strerror(errno));
+
+  *master_out = master;
+  *slave_out = slave;
+}
+
+/* fork a child on the PTY slave (its controlling terminal), optionally
+ * dropping privileges, then exec cmd */
+static pid_t spawn_child(const char *cmd, char *argv[], int master, int slave, const char *runas)
+{
+  pid_t pid = fork();
+
+  if (pid < 0) die("fork failed: %s", strerror(errno));
+  if (pid == 0) {
+    setsid();
+    if (ioctl(slave, TIOCSCTTY, 0) < 0) die("cannot set controlling tty: %s", strerror(errno));
+    if (runas && switch_user(runas) != 0) _exit(1);
+    if (serial_fd >= 0) close(serial_fd);
+    if (master >= 0) close(master);
+    dup2(slave, STDIN_FILENO);
+    dup2(slave, STDOUT_FILENO);
+    dup2(slave, STDERR_FILENO);
+    fcntl(STDIN_FILENO, F_SETFD, 0);
+    fcntl(STDOUT_FILENO, F_SETFD, 0);
+    fcntl(STDERR_FILENO, F_SETFD, 0);
+    if (slave > STDERR_FILENO) close(slave);
+    execv(cmd, argv);
+    _exit(1);
+  }
+  return pid;
+}
+
+/*
+ * Register `line` as a login process in utmp/wtmp (a getty does this; the
+ * login program updates the entry to USER_PROCESS on success). The name is
+ * taken without the leading "/dev/", matching login's ttyname. Best effort:
+ * errors (e.g. non-root) are ignored.
+ */
+static void put_utmp(const char *line)
+{
+  const char *tty = line;
+  struct utmpx ut;
+  struct timeval tv;
+  size_t n;
+
+  if (strncmp(tty, "/dev/", 5) == 0) tty += 5;
+  n = strlen(tty);
+
+  memset(&ut, 0, sizeof(ut));
+  ut.ut_type = LOGIN_PROCESS;
+  ut.ut_pid = getpid();
+  snprintf(ut.ut_line, sizeof(ut.ut_line), "%s", tty);
+  snprintf(ut.ut_id, sizeof(ut.ut_id), "%s", tty + (n > 4 ? n - 4 : 0));
+  snprintf(ut.ut_user, sizeof(ut.ut_user), "LOGIN");
+  if (caller_id && strcmp(caller_id, "none") != 0)
+    snprintf(ut.ut_host, sizeof(ut.ut_host), "%s", caller_id);
+  else if (connect) snprintf(ut.ut_host, sizeof(ut.ut_host), "%s", connect);
+  gettimeofday(&tv, NULL);
+  ut.ut_tv.tv_sec = (unsigned int)tv.tv_sec;
+  ut.ut_tv.tv_usec = (unsigned int)tv.tv_usec;
+
+  setutxent();
+  pututxline(&ut);
+  endutxent();
+  updwtmpx(_PATH_WTMP, &ut);
+}
+
 /*
  * Hand the line to the login program. If we are not already a session
  * leader (e.g. m2ppp was started from a shell), fork first so the child
@@ -1436,8 +1602,12 @@ static int exec_login(int fd, const char *prog, char *const argv[])
   return -1;
 }
 
-/* exec the login program for `name`; returns -1 if the tty is busy */
-static int do_login(int fd, const char *name)
+/*
+ * Run the login program for `name` (the st_exec_login handoff).
+ * Returns 0 when the session ended (or the tty was busy), -1 if the line was
+ * lost and the caller should reopen it.
+ */
+static int run_login(const char *name)
 {
   char *argv[3];
   const char *prog = opt_login, *slash;
@@ -1447,9 +1617,19 @@ static int do_login(int fd, const char *name)
   argv[1] = (char *)name;
   argv[2] = NULL;
 
+  step("login as '%s'", name);
+
+  /* exec login on the real line; on success this never returns. A busy tty
+   * (exec_login -1) is a back-off, not a lost line. */
+  tio_mode_sane(serial_fd);
   lock_remove();
   setup_environment();
-  return exec_login(fd, prog, argv);
+  put_utmp(opt_device);
+  if (exec_login(serial_fd, prog, argv) < 0) {
+    step("cannot take the tty for login (already in use)");
+    if (lock_line() < 0) die("cannot re-acquire lock after failed login");
+  }
+  return 0;
 }
 
 /* show issue/banner + hostname login prompt (+ pre-prompt typing) */
@@ -1458,15 +1638,6 @@ static void show_login_prompt(int fd, const char *prompt, const char *name, size
   show_issue(fd);
   write_full(fd, prompt, strlen(prompt));
   if (len) write_full(fd, name, len);
-}
-
-/* newline + sane tty, then exec login; -1 if the tty is busy */
-static int submit_login(int fd, const char *name)
-{
-  write_full(fd, "\r\n", 2);
-  tio_mode_sane(fd);
-  step("login as '%s'", name);
-  return do_login(fd, name);
 }
 
 /* buffer one keystroke received before the prompt is shown */
@@ -1479,14 +1650,15 @@ static void name_input(unsigned char c, char *name, size_t *len, size_t max)
  * After CONNECT: watch for a PPP frame for up to detect_sec. If no PPP frame
  * has been seen after prompt_sec, show the login prompt; detection keeps
  * running while the user types so a slow PPP client can still take over.
- * On Enter the login program is exec()ed.
+ * On Enter the collected login name is returned to the caller.
  *
- * Returns 1 if PPP was detected (hand over to pppd), 0 if the call
- * should be dropped, -1 if the line was lost.
+ * Returns 1 if PPP was detected (hand over to pppd), 2 if a login was
+ * requested (name filled in), 0 if the call should be dropped, -1 if the
+ * line was lost.
  */
-static int wait_ppp_or_login(int fd, int detect_sec, int prompt_sec)
+static int detect_type(int fd, int detect_sec, int prompt_sec, char *name, size_t name_max)
 {
-  char host[64], name[128], prompt[128];
+  char host[64], prompt[128];
   int fr, prompted = 0, r;
   long long cur, deadline, prompt_at, wait_ms;
   size_t i, len = 0;
@@ -1499,7 +1671,7 @@ static int wait_ppp_or_login(int fd, int detect_sec, int prompt_sec)
 
   /* bytes buffered with the CONNECT result may already start the frame */
   for (i = 0; i < ppp_len; i++)
-    if (ppp_feed(ppp_buf[i]) == 1) return 1;
+    if (ppp_feed(ppp_buf[i]) == 1) return DETECTED_PPP;
 
   if (gethostname(host, sizeof(host)) < 0) snprintf(host, sizeof(host), "localhost");
   host[sizeof(host) - 1] = '\0';
@@ -1518,25 +1690,25 @@ static int wait_ppp_or_login(int fd, int detect_sec, int prompt_sec)
       step("no PPP after %ds, showing login prompt", prompt_sec);
       prompted = 1;
     }
-    if (cur >= deadline) return 0;
+    if (cur >= deadline) return DETECTED_DROP;
 
     /* next event is the prompt (if still pending) or the deadline; both follow cur */
     wait_ms = (prompted ? deadline : prompt_at) - cur;
     if (wait_ms > INT_MAX) wait_ms = INT_MAX;
 
     r = serial_read_char(fd, (int)wait_ms, &c);
-    if (r == SERIAL_LOST) return -1;
-    if (r == SERIAL_ERROR) return 0;
+    if (r == SERIAL_LOST) return DETECTED_LOST;
+    if (r == SERIAL_ERROR) return DETECTED_DROP;
     if (r == SERIAL_TIMEOUT) continue;
 
     /* keep the byte for pppd and keep detecting PPP */
     if (ppp_len < sizeof(ppp_buf)) ppp_buf[ppp_len++] = c;
     fr = ppp_feed(c);
-    if (fr == 1) return 1;
+    if (fr == 1) return DETECTED_PPP;
 
     if (!prompted) {
       /* remember what was typed before the prompt, show it afterwards */
-      name_input(c, name, &len, sizeof(name) - 1);
+      name_input(c, name, &len, name_max);
 
       if (fr < 0) {
         show_login_prompt(fd, prompt, name, len);
@@ -1552,10 +1724,9 @@ static int wait_ppp_or_login(int fd, int detect_sec, int prompt_sec)
         continue;
       }
       name[len] = '\0';
-      if (submit_login(fd, name) < 0) step("cannot take the tty for login (already in use)");
-      return 0;
+      return DETECTED_LOGIN;
     }
-    if (login_special(fd, name, &len, sizeof(name) - 1, prompt, c)) return 0;
+    if (login_special(fd, name, &len, name_max, prompt, c)) return DETECTED_DROP;
   }
 }
 
@@ -1592,91 +1763,11 @@ static void build_pppd_argv(char *argv[], char *opts_file, size_t opts_size)
   argv[argc] = NULL;
 }
 
-static void create_pty(int *master_out, int *slave_out, char *slave_name, size_t name_len)
-{
-  const char *name;
-  int master, slave;
-  struct termios t;
-
-  master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
-  if (master < 0 || grantpt(master) < 0 || unlockpt(master) < 0)
-    die("cannot create pty: %s", strerror(errno));
-  name = ptsname(master);
-  if (name == NULL) die("ptsname failed: %s", strerror(errno));
-  snprintf(slave_name, name_len, "%s", name);
-
-  slave = open(slave_name, O_RDWR | O_NOCTTY | O_CLOEXEC);
-  if (slave < 0) die("cannot open %s: %s", slave_name, strerror(errno));
-  step("pty slave: %s", slave_name);
-  if (tcgetattr(slave, &t) < 0) die("cannot get tty attrs for %s: %s", slave_name, strerror(errno));
-  cfmakeraw(&t);
-  t.c_cflag |= (CLOCAL | CREAD);
-  if (tcsetattr(slave, TCSANOW, &t) < 0)
-    die("cannot configure %s: %s", slave_name, strerror(errno));
-
-  *master_out = master;
-  *slave_out = slave;
-}
-
-static pid_t spawn_pppd(const char *cmd, char *argv[], int master, int slave)
-{
-  pid_t pid = fork();
-
-  if (pid < 0) die("fork failed: %s", strerror(errno));
-  if (pid == 0) {
-    /* child: pppd, with the PTY slave as its controlling terminal */
-    setsid();
-    if (ioctl(slave, TIOCSCTTY, 0) < 0) die("cannot set controlling tty: %s", strerror(errno));
-    if (opt_runas && switch_user(opt_runas) != 0) _exit(1);
-    if (serial_fd >= 0) close(serial_fd);
-    if (master >= 0) close(master);
-    dup2(slave, STDIN_FILENO);
-    dup2(slave, STDOUT_FILENO);
-    dup2(slave, STDERR_FILENO);
-    if (slave > STDERR_FILENO) close(slave);
-    execv(cmd, argv);
-    _exit(1);
-  }
-  return pid;
-}
-
-/* returns 0 when pppd ended normally (the process then exits), -1 if the
- * serial line was lost and the caller should reopen it */
-static int relay_and_reap(int master, pid_t pid)
-{
-  int rc, status;
-
-  if (ppp_len) {
-    step("replaying %zu PPP byte(s) to pppd", ppp_len);
-    write_full(master, ppp_buf, ppp_len);
-  }
-  step("pppd started, relaying");
-  rc = relay_loop(serial_fd, master, opt_ppp_idle_minutes * 60);
-  if (rc == relay_idle) {
-    step("idle timeout, terminating pppd");
-    kill(pid, SIGTERM);
-  }
-  else if (rc == relay_lost) {
-    step("serial line lost, terminating pppd");
-    kill(pid, SIGTERM);
-  }
-
-  status = 0;
-  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) check_signal();
-  step("pppd exited");
-  tio_hangup(serial_fd);
-
-  if (rc == relay_lost) return -1; /* hand back to the state machine */
-
-  lock_remove();
-  _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 1);
-}
-
 static int run_pppd(void)
 {
   /* prog name + "modem" + MAX_PPPD_ARGS extras + "file" + path + NULL */
   char *argv[MAX_PPPD_ARGS + 5], opts_file[256], slave_name[128];
-  int master, slave;
+  int master, slave, rc, status;
   pid_t pid;
 
   setup_environment();
@@ -1684,15 +1775,30 @@ static int run_pppd(void)
 
   /* pppd runs on a PTY, so keep the lock on the real line while we relay */
   create_pty(&master, &slave, slave_name, sizeof(slave_name));
-  pid = spawn_pppd(opt_pppd, argv, master, slave);
+  pid = spawn_child(opt_pppd, argv, master, slave, opt_runas);
+  child_pid = pid;
 
   /* parent: relay */
   close(slave);
-  if (relay_and_reap(master, pid) < 0) {
-    close(master);
-    return -1; /* line lost: let the state machine reopen it */
+  if (ppp_len) {
+    step("replaying %zu PPP byte(s) to pppd", ppp_len);
+    write_full(master, ppp_buf, ppp_len);
   }
-  return 0;
+
+  step("pppd started, relaying");
+  rc = relay_loop(serial_fd, master, opt_ppp_idle_minutes * 60);
+  if (rc == relay_idle || rc == relay_lost) {
+    step(rc == relay_idle ? "idle timeout, terminating pppd"
+                          : "serial line lost, terminating pppd");
+  }
+  reap_child(pid, &status, rc == relay_idle || rc == relay_lost);
+  child_pid = -1;
+
+  step("pppd exited with status %d", WIFEXITED(status) ? WEXITSTATUS(status) : 1);
+  close(master);
+  tio_hangup(serial_fd);
+
+  return rc == relay_lost ? -1 : 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1839,18 +1945,6 @@ static int parse_options(int argc, char **argv)
   return 0;
 }
 
-/* take the UUCP lock, for the life of the process. 0 on success. */
-static int lock_line(void)
-{
-  step("locking %s", opt_device);
-  if (lock_check(opt_device) != 0 || lock_make(opt_device) != 0) {
-    step("line is locked, giving up");
-    return -1;
-  }
-  step("lock acquired");
-  return 0;
-}
-
 /* close any previous fd, then open and configure the line. 0 on success. */
 static int open_line(void)
 {
@@ -1879,6 +1973,7 @@ static int open_line(void)
 static int run_state_machine(void)
 {
   enum m2ppp_state state = st_init;
+  char login_name[128];
   int rc, retry;
 
   while (state != st_unknown) {
@@ -1964,12 +2059,16 @@ static int run_state_machine(void)
       }
 
       case st_detect_ppp:
-        rc = wait_ppp_or_login(serial_fd, opt_ppp_detect_seconds, opt_prompt_seconds);
-        if (rc > 0) {
+        rc = detect_type(serial_fd, opt_ppp_detect_seconds, opt_prompt_seconds, login_name,
+                         sizeof(login_name));
+        if (rc == DETECTED_PPP) {
           step("PPP frame detected");
           state = st_exec_ppp;
         }
-        else if (rc < 0) {
+        else if (rc == DETECTED_LOGIN) {
+          state = st_exec_login;
+        }
+        else if (rc == DETECTED_LOST) {
           state = st_open;
         }
         else {
@@ -1979,9 +2078,22 @@ static int run_state_machine(void)
         }
         break;
 
+      case st_exec_login:
+        write_full(serial_fd, "\r\n", 2);
+        if (run_login(login_name) < 0) state = st_open; /* line lost */
+        else {
+          hangup_line();
+          state = st_waiting;
+        }
+        break;
+
       case st_exec_ppp:
         step("handing over to pppd");
         if (run_pppd() < 0) state = st_open; /* line lost during the session */
+        else {
+          hangup_line();
+          state = st_waiting;
+        }
         break;
 
       case st_unknown:
@@ -2000,6 +2112,8 @@ int main(int argc, char **argv)
   rc = parse_options(argc, argv);
   if (rc > 0) return 0; /* -h: usage already printed */
   if (rc < 0) return 1;
+
+  step("m2ppp built %s %s", __DATE__, __TIME__);
 
   install_signal(SIGINT);
   install_signal(SIGTERM);
@@ -2028,4 +2142,3 @@ int main(int argc, char **argv)
   lock_remove();
   return rc;
 }
-
