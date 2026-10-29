@@ -19,7 +19,7 @@
  * here are written from scratch.
  *
  * usage: m2ppp [options] [-- pppd-args...]
- *   -d device    serial device                           (default /dev/ttyds01)
+ *   -d device    serial device                           (default /dev/ttyds1)
  *   -b baud      initial line speed                      (default 38400)
  *   -i string    init chat (without CR)                  (default below)
  *   -a string    answer chat                             (default ATA)
@@ -31,10 +31,13 @@
  *   -w seconds   PPP frame detection window              (default 60)
  *   -P seconds   show login prompt after N sec           (default 6)
  *   -c seconds   pause before waiting again              (default 0)
- *   -I minutes   hang up an idle PPP session after N min (default 10)
+ *   -I minutes   hang up a PPP call after N min with no data from the caller
+ *                (default 10; pppd's own output does not count)
  *   -r seconds   modem-reinit/select interval            (default 900)
  *   -o seconds   wait for the modem OK after init        (default 2)
  *   -T string    TERM for login sessions                 (default vt100)
+ *   -H           pass the caller id to login as its remote host (login -h;
+ *                needs /etc/pam.d/remote, login's PAM service with -h)
  *   -v           trace every step of the call flow to stdout
  *   -F           do not add /etc/ppp/options.<device> to pppd
  *   -h           show this help and exit
@@ -81,7 +84,7 @@
 /* default option values */
 #define ANSWER_DEFAULT "ATA"
 #define BAUD_DEFAULT 38400
-#define DEVICE_DEFAULT "/dev/ttyds01"
+#define DEVICE_DEFAULT "/dev/ttyds1"
 #define INIT_DEFAULT "AT&F14+IF5+IM4;S0=0;E0;V1#CID=9"
 #define LOCKDIR_DEFAULT "/var/lock"
 #define LOGIN_DEFAULT "/bin/login"
@@ -91,11 +94,26 @@
 /* max extra pppd arguments accepted after "--", not counting "modem" */
 #define MAX_PPPD_ARGS 16
 
-#define CHAT_DELAY_US 500000
+#define CHAT_DELAY_MS 500
 #define CHILD_TERM_MS 5000
+#define CHILD_POLL_MS 100
+#define LOGIN_GAP_MS 5000
+#define LOGIN_DRAIN_MS 1000
 #define CONNECT_CAPTURE_MS 2000
 #define POLL_SLICE_MS 1500
+/* longest wait for pppd to set up (and flush) its tty before the replay */
+#define REPLAY_WAIT_MS 2000
+/* longest wait for room to write (e.g. CTS held low by the modem) */
+#define WRITE_TIMEOUT_MS 10000
+/* bytes written per write() once poll() reports room; a tty with POLLOUT has
+ * fewer than 256 bytes queued, so this never blocks */
+#define WRITE_CHUNK 256
+/* a lock file without a valid pid is stale once it is this old (younger ones
+ * may still be being written by another program) */
+#define LOCK_EMPTY_STALE_SECONDS 5
 #define ISSUE_FILE "/etc/issue.net"
+/* PAM service file util-linux login uses with -h (-H) */
+#define PAM_REMOTE_FILE "/etc/pam.d/remote"
 
 #define DIGIT_CHARS "0123456789"
 /* caller/called numbers may carry *#+/; the CONNECT speed does not */
@@ -149,6 +167,11 @@
 #define DETECTED_LOGIN 2   /* login name entered: run the login   */
 #define DETECTED_LOST (-1) /* line lost: reopen                 */
 
+/* chat_capture_connect() results */
+#define CAPTURE_OK 0
+#define CAPTURE_LOST (-1) /* line lost while scanning             */
+#define CAPTURE_FULL (-2) /* PPP replay buffer filled: drop the call */
+
 /* termios flow control */
 #define FLOW_NONE 0
 #define FLOW_SOFT 1
@@ -159,10 +182,94 @@
 #define CRTSCTS 0
 #endif
 
-static int opt_verbose; /* -v: trace each step to stdout */
+/* ------------------------------------------------------------------ */
+/* global call data / options                                         */
+/* ------------------------------------------------------------------ */
 
 /* set by the signal handler (async-signal-safe), acted on by check_signal() */
 static volatile sig_atomic_t g_signal;
+
+static pid_t main_pid; /* the daemon itself, not a forked child */
+
+static const char *opt_device = DEVICE_DEFAULT;   /* -d: serial device */
+static const char *opt_lockdir = LOCKDIR_DEFAULT; /* -L: UUCP lock directory */
+static const char *opt_pppd = PPPD_DEFAULT;       /* -p: pppd program */
+static const char *opt_login = LOGIN_DEFAULT;     /* -g: login program for non-PPP calls */
+static const char *opt_runas;                     /* -u user: run pppd as this user, else keep */
+static const char *opt_init = INIT_DEFAULT;       /* -i: modem init chat (sent without CR) */
+static const char *opt_answer = ANSWER_DEFAULT;   /* -a: answer chat */
+static const char *opt_term = TERM_DEFAULT;       /* -T: TERM for login sessions */
+static int opt_verbose;                           /* -v: trace each step to stdout */
+static int opt_baud = BAUD_DEFAULT;               /* -b: initial line speed */
+static int opt_answer_seconds = ANSWER_SECONDS_DEFAULT;         /* -t: answer timeout (sec) */
+static int opt_ppp_detect_seconds = PPP_DETECT_SECONDS_DEFAULT; /* -w: PPP detect window (sec) */
+static int opt_prompt_seconds = LOGIN_PROMPT_SECONDS_DEFAULT;   /* -P: prompt after (sec) */
+static int opt_cooldown_seconds;                                /* -c: pause before waiting (sec) */
+static int opt_ppp_idle_minutes = PPP_IDLE_MINUTES_DEFAULT;     /* -I: PPP idle timeout (min) */
+static int opt_reinit_seconds = MODEM_REINIT_SECONDS_DEFAULT; /* -r: modem reinit interval (sec) */
+static int opt_init_ok_seconds = INIT_OK_SECONDS_DEFAULT;     /* -o: init OK timeout (sec) */
+static int opt_no_optsfile;                                   /* -F: no /etc/ppp/options.<dev> */
+static int opt_remote_host;                                   /* -H: caller id as login -h host */
+
+/* "modem" plus up to MAX_PPPD_ARGS extra pppd args */
+static char *pppd_args[MAX_PPPD_ARGS + 1];
+static int pppd_argc;
+
+static char *connect;
+static char *caller_id;
+static char *called_nr;
+
+static int serial_fd = -1;
+static pid_t child_pid = -1;
+static const char *child_utmp_line; /* login child's utmp line, ended if we exit */
+static char lock_files[MAX_LOCK_FILES][256];
+static int lock_count;
+
+/*
+ * Bytes read while watching for the PPP frame. These belong to
+ * the caller's PPP stream, so they are replayed to pppd over the PTY
+ * before the relay takes over (otherwise pppd would lose the first
+ * LCP frame).
+ */
+static unsigned char ppp_buf[8192];
+static size_t ppp_len;
+
+/* caller-id line accumulator */
+static char cnd_line[512];
+static size_t cnd_len;
+
+/*
+ * Strings that abort a chat even if the expected answer has not shown up.
+ * mgetty calls these "action strings" (ring_chat_actions in mgetty.c); a
+ * modem that answers ATA with "NO CARRIER" must not make us wait for
+ * CONNECT until the timeout.
+ */
+static const char *const answer_aborts[] = {"NO CARRIER", "BUSY", "ERROR", NULL};
+
+/* PPP frame detection state machine (see mgetty's logname.c) */
+static int ppp_level;
+static int ppp_escaped;
+
+/*
+ * Numeric baud rate -> termios speed. The high rates are non-POSIX
+ * extensions, so they are guarded with #ifdef (as in mgetty's speedtab).
+ */
+static const struct {
+  int rate;
+  speed_t speed;
+} baudtab[] = {
+    {300, B300},       {1200, B1200},   {2400, B2400},   {4800, B4800},
+    {9600, B9600},     {19200, B19200}, {38400, B38400},
+#ifdef B57600
+    {57600, B57600},
+#endif
+#ifdef B115200
+    {115200, B115200},
+#endif
+};
+
+/* wtmp file the utmp records are appended to (the unit test redirects it) */
+static const char *wtmp_path = _PATH_WTMP;
 
 /* "YYYY-MM-DD HH:MM:SS " prefix for log lines */
 static void print_timestamp(FILE *fp)
@@ -186,7 +293,10 @@ static long long now(void)
   return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* print "TIMESTAMP m2ppp: <msg>" to stderr and exit (fatal errors) */
+static void shutdown_call(void);
+
+/* print "TIMESTAMP m2ppp: <msg>" to stderr and exit (fatal errors); in the
+ * daemon also hang up and clean up as on SIGTERM, since this can happen mid-call */
 static void die(const char *fmt, ...)
 {
   va_list ap;
@@ -197,6 +307,7 @@ static void die(const char *fmt, ...)
   vfprintf(stderr, fmt, ap);
   va_end(ap);
   fputc('\n', stderr);
+  if (main_pid && getpid() == main_pid) shutdown_call();
   _exit(1);
 }
 
@@ -214,36 +325,6 @@ static void step(const char *fmt, ...)
   fputc('\n', stdout);
   fflush(stdout);
 }
-
-/* ------------------------------------------------------------------ */
-/* global call data / options                                         */
-/* ------------------------------------------------------------------ */
-
-static const char *opt_device = DEVICE_DEFAULT;   /* -d: serial device */
-static const char *opt_lockdir = LOCKDIR_DEFAULT; /* -L: UUCP lock directory */
-static const char *opt_pppd = PPPD_DEFAULT;       /* -p: pppd program */
-static const char *opt_login = LOGIN_DEFAULT;     /* -g: login program for non-PPP calls */
-static const char *opt_runas;                     /* -u user: run pppd as this user, else keep */
-static const char *opt_init = INIT_DEFAULT;       /* -i: modem init chat (sent without CR) */
-static const char *opt_answer = ANSWER_DEFAULT;   /* -a: answer chat */
-static const char *opt_term = TERM_DEFAULT;       /* -T: TERM for login sessions */
-static int opt_baud = BAUD_DEFAULT;               /* -b: initial line speed */
-static int opt_answer_seconds = ANSWER_SECONDS_DEFAULT;         /* -t: answer timeout (sec) */
-static int opt_ppp_detect_seconds = PPP_DETECT_SECONDS_DEFAULT; /* -w: PPP detect window (sec) */
-static int opt_prompt_seconds = LOGIN_PROMPT_SECONDS_DEFAULT;   /* -P: prompt after (sec) */
-static int opt_cooldown_seconds;                                /* -c: pause before waiting (sec) */
-static int opt_ppp_idle_minutes = PPP_IDLE_MINUTES_DEFAULT;     /* -I: PPP idle timeout (min) */
-static int opt_reinit_seconds = MODEM_REINIT_SECONDS_DEFAULT; /* -r: modem reinit interval (sec) */
-static int opt_init_ok_seconds = INIT_OK_SECONDS_DEFAULT;     /* -o: init OK timeout (sec) */
-static int opt_no_optsfile;                                   /* -F: no /etc/ppp/options.<dev> */
-
-/* "modem" plus up to MAX_PPPD_ARGS extra pppd args */
-static char *pppd_args[MAX_PPPD_ARGS + 1];
-static int pppd_argc;
-
-static char *connect;
-static char *caller_id;
-static char *called_nr;
 
 /* set *var to a copy of val when it differs; returns 1 if it changed */
 static int cnd_assign(char **var, const char *val)
@@ -276,11 +357,6 @@ static void reset_call_data(void)
   cnd_assign(&caller_id, "none");
   cnd_assign(&called_nr, "");
 }
-
-static int serial_fd = -1;
-static pid_t child_pid = -1;
-static char lock_files[MAX_LOCK_FILES][256];
-static int lock_count;
 
 /* ------------------------------------------------------------------ */
 /* UUCP-style lock files                                              */
@@ -327,7 +403,8 @@ static int lock_read_pid(const char *name)
   return pid;
 }
 
-/* return pid of a holder of any lock file, or 0 if free (stale ones removed) */
+/* return pid of a holder of any lock file, -1 if a lock has no valid pid yet,
+ * or 0 if free (stale ones removed) */
 static int lock_check(const char *dev)
 {
   char names[MAX_LOCK_FILES][256];
@@ -336,10 +413,19 @@ static int lock_check(const char *dev)
 
   n = lock_names(dev, names, MAX_LOCK_FILES);
   for (i = 0; i < n; i++) {
-    if (stat(names[i], &st) < 0 && errno == ENOENT) continue;
+    if (stat(names[i], &st) < 0) {
+      if (errno == ENOENT) continue;
+      st.st_mtime = time(NULL); /* age unknown: an empty one counts as busy */
+    }
 
     pid = lock_read_pid(names[i]);
-    if (pid <= 0) continue;
+    if (pid <= 0) {
+      /* empty or garbage (e.g. a crash between create and write): stale
+       * once old enough, else assume its creator is still writing it */
+      if (time(NULL) - st.st_mtime < LOCK_EMPTY_STALE_SECONDS) return -1;
+      unlink(names[i]);
+      continue;
+    }
     if (pid == getpid()) continue;
     if (kill(pid, 0) < 0 && errno == ESRCH) {
       unlink(names[i]);
@@ -359,28 +445,35 @@ static void lock_remove(void)
   lock_count = 0;
 }
 
+/* write our pid to a temporary file and link() it into place, so a lock file
+ * is never seen without its pid */
 static int lock_make(const char *dev)
 {
-  char buf[32];
-  int fd, i, n;
+  char buf[32], tmp[sizeof(lock_files[0]) + 16];
+  int fd, i, n, rc;
 
   n = lock_names(dev, lock_files, MAX_LOCK_FILES);
   snprintf(buf, sizeof(buf), "%10d\n", (int)getpid());
 
   lock_count = 0;
   for (i = 0; i < n; i++) {
-    fd = open(lock_files[i], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    rc = snprintf(tmp, sizeof(tmp), "%s.%d", lock_files[i], (int)getpid());
+    fd = rc > 0 && (size_t)rc < sizeof(tmp)
+             ? open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)
+             : -1;
     if (fd < 0) {
       lock_remove();
       return -1;
     }
-    lock_count++; /* this file exists now and must be cleaned up */
-    if (write(fd, buf, strlen(buf)) != (ssize_t)strlen(buf)) {
-      close(fd);
+    rc = write(fd, buf, strlen(buf)) == (ssize_t)strlen(buf) ? 0 : -1;
+    if (close(fd) < 0) rc = -1;
+    if (rc == 0) rc = link(tmp, lock_files[i]);
+    unlink(tmp);
+    if (rc < 0) {
       lock_remove();
       return -1;
     }
-    close(fd);
+    lock_count++; /* this file exists now and must be cleaned up */
   }
   return 0;
 }
@@ -396,31 +489,6 @@ static int lock_line(void)
   step("lock acquired");
   return 0;
 }
-
-/*
- * Bytes read while watching for the PPP frame. These belong to
- * the caller's PPP stream, so they are replayed to pppd over the PTY
- * before the relay takes over (otherwise pppd would lose the first
- * LCP frame).
- */
-static unsigned char ppp_buf[8192];
-static size_t ppp_len;
-
-/* caller-id line accumulator */
-static char cnd_line[512];
-static size_t cnd_len;
-
-/*
- * Strings that abort a chat even if the expected answer has not shown up.
- * mgetty calls these "action strings" (ring_chat_actions in mgetty.c); a
- * modem that answers ATA with "NO CARRIER" must not make us wait for
- * CONNECT until the timeout.
- */
-static const char *const answer_aborts[] = {"NO CARRIER", "BUSY", "ERROR", NULL};
-
-/* PPP frame detection state machine (see mgetty's logname.c) */
-static int ppp_level;
-static int ppp_escaped;
 
 /*
  * mgetty-style state machine for handling one call.
@@ -439,30 +507,12 @@ enum m2ppp_state {
   st_answer_phone, /* ATA, wait for CONNECT                     */
   st_detect_ppp,   /* watch for the start of a PPP frame        */
   st_exec_login,   /* run the login program                     */
-  st_exec_ppp      /* hand the line to pppd (does not return)   */
+  st_exec_ppp      /* hand the line to pppd                     */
 };
 
 /* ------------------------------------------------------------------ */
 /* termios line control (mgetty "tio" style)                          */
 /* ------------------------------------------------------------------ */
-
-/*
- * Numeric baud rate -> termios speed. The high rates are non-POSIX
- * extensions, so they are guarded with #ifdef (as in mgetty's speedtab).
- */
-static const struct {
-  int rate;
-  speed_t speed;
-} baudtab[] = {
-    {300, B300},       {1200, B1200},   {2400, B2400},   {4800, B4800},
-    {9600, B9600},     {19200, B19200}, {38400, B38400},
-#ifdef B57600
-    {57600, B57600},
-#endif
-#ifdef B115200
-    {115200, B115200},
-#endif
-};
 
 static speed_t baud_to_speed(int baud)
 {
@@ -569,15 +619,9 @@ static void tio_mode_sane_flags(struct termios *t)
 static void tio_mode_sane(int fd)
 {
   struct termios t;
-  int status;
 
   if (tio_get(fd, &t) < 0) return;
   tio_mode_sane_flags(&t);
-
-  /* DCD is logged for diagnostics (carrier-sensitive login: a DCD drop hangs
-   * up the login session) */
-  if (ioctl(fd, TIOCMGET, &status) < 0) step("login: DCD unknown");
-  else step("login: DCD %s", (status & TIOCM_CAR) ? "on" : "off");
   tio_carrier(&t, 1);                  /* carrier-sensitive: a DCD drop hangs up the session */
   tio_set_flow_control(&t, FLOW_SOFT); /* software XON/XOFF; drops the stale CRTSCTS */
 
@@ -593,25 +637,30 @@ static void tio_hangup_on_close(struct termios *t, int on)
 
 /*
  * Hang up the line: setting the speed to B0 drops DTR on a real serial
- * port, so no TIOCM* ioctl is needed for this.
+ * port, so no TIOCM* ioctl is needed for this. CLOCAL goes on first: the
+ * modem drops DCD in answer, and on the carrier-sensitive call line the
+ * driver would hang up our own fd.
  */
 static void tio_hangup(int fd)
 {
   struct termios t;
 
   if (tio_get(fd, &t) < 0) return;
+  tio_carrier(&t, 0);
   tio_hangup_on_close(&t, 1);
   tio_set_speed(&t, 0); /* B0 == hang up */
   tio_set(fd, &t);
 }
 
-/* re-assert DTR by restoring a real line speed */
+/* re-assert DTR by restoring a real line speed, and the modem's RTS/CTS
+ * (a login session leaves the line on FLOW_SOFT) */
 static void tio_raise(int fd, int baud)
 {
   struct termios t;
 
   if (tio_get(fd, &t) < 0) return;
   tio_mode_raw(&t);
+  tio_set_flow_control(&t, FLOW_HARD);
   tio_set_speed(&t, baud);
   tio_carrier(&t, 0);
   tio_hangup_on_close(&t, 1);
@@ -634,7 +683,12 @@ static int serial_open(const char *dev)
   }
 
   fl = fcntl(fd, F_GETFL, 0);
-  fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+  if (fl < 0 || fcntl(fd, F_SETFL, fl & ~O_NONBLOCK) < 0) {
+    saved = errno;
+    close(fd);
+    errno = saved;
+    return -1;
+  }
   return fd;
 }
 
@@ -654,12 +708,17 @@ static int serial_config(int fd, int baud)
   return 0;
 }
 
-static void serial_set_hardflow(int fd)
+/* line mode for a connected call: RTS/CTS, and carrier-sensitive, so a DCD
+ * drop makes the driver hang the tty up and the relay ends (read() fails)
+ * instead of pppd running on a dead call. hangup_line()/open_line() set
+ * CLOCAL again for the idle line. */
+static void serial_set_call_mode(int fd)
 {
   struct termios t;
 
   if (tio_get(fd, &t) < 0) return;
   tio_set_flow_control(&t, FLOW_HARD);
+  tio_carrier(&t, 1);
   tio_set(fd, &t);
 }
 
@@ -682,23 +741,32 @@ static void sig_handler(int sig)
   g_signal = sig;
 }
 
-/* terminate and reap the active relay child before exiting */
-static void terminate_child(void)
+/* signal the child's process group (it is a session leader after setsid()),
+ * so helpers it started in its own group go too; just the child if the
+ * group does not exist yet (signalled before its setsid()) */
+static void kill_child(pid_t pid, int sig)
 {
-  int status;
+  if (kill(-pid, sig) < 0) kill(pid, sig);
+}
+
+/* terminate and reap the active child before exiting; *status gets its
+ * wait status (0 if there was none) */
+static void terminate_child(int *status)
+{
   long long deadline;
   pid_t r;
 
+  *status = 0;
   if (child_pid <= 0) return;
 
-  kill(child_pid, SIGTERM);
+  kill_child(child_pid, SIGTERM);
   deadline = now() + CHILD_TERM_MS;
   for (;;) {
-    r = waitpid(child_pid, &status, WNOHANG);
+    r = waitpid(child_pid, status, WNOHANG);
     if (r == child_pid || (r < 0 && errno != EINTR)) break;
     if (now() >= deadline) {
-      kill(child_pid, SIGKILL);
-      while (waitpid(child_pid, &status, 0) < 0 && errno == EINTR) {
+      kill_child(child_pid, SIGKILL);
+      while (waitpid(child_pid, status, 0) < 0 && errno == EINTR) {
       }
       break;
     }
@@ -706,6 +774,8 @@ static void terminate_child(void)
   }
   child_pid = -1;
 }
+
+static void end_utmp(const char *line, pid_t pid, int status);
 
 /* install a handler that interrupts blocking calls (no SA_RESTART) */
 static void install_signal(int sig)
@@ -717,6 +787,23 @@ static void install_signal(int sig)
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = 0;
   sigaction(sig, &sa, NULL);
+}
+
+/* before exiting on a signal or die(): hang up, end the child and its utmp
+ * entry, drop the lock */
+static void shutdown_call(void)
+{
+  pid_t pid = child_pid;
+  int status;
+
+  if (serial_fd >= 0) {
+    tcflush(serial_fd, TCOFLUSH); /* or the exit's close() waits for CTS */
+    tio_hangup(serial_fd);
+  }
+  terminate_child(&status);
+  /* a login session we end must leave who/last too */
+  if (child_utmp_line && pid > 0) end_utmp(child_utmp_line, pid, status);
+  lock_remove();
 }
 
 static void check_signal(void)
@@ -732,10 +819,44 @@ static void check_signal(void)
   else if (sig == SIGHUP) name = "SIGHUP";
 
   step("caught %s, hanging up", name);
-  if (serial_fd >= 0) tio_hangup(serial_fd);
-  terminate_child();
-  lock_remove();
+  shutdown_call();
   _exit(1);
+}
+
+/*
+ * Waits that a signal cannot slip past: one that lands after the last
+ * check_signal() but before a blocking sleep()/waitpid() would otherwise
+ * wait out the whole call (a long cooldown, or a login session).
+ */
+
+/* sleep ms in POLL_SLICE_MS slices, checking for a signal before each */
+static void nap(long long ms)
+{
+  long long end = now() + ms, left;
+
+  for (;;) {
+    check_signal();
+    left = end - now();
+    if (left <= 0) return;
+    poll(NULL, 0, left > POLL_SLICE_MS ? POLL_SLICE_MS : (int)left);
+  }
+}
+
+/* wait up to timeout_ms (< 0: forever) for child pid to exit, checking for
+ * a signal every CHILD_POLL_MS. 0 once reaped, -1 on timeout. */
+static int wait_child(pid_t pid, int *status, long long timeout_ms)
+{
+  long long end = now() + timeout_ms;
+  pid_t r;
+
+  *status = 0;
+  for (;;) {
+    check_signal();
+    r = waitpid(pid, status, WNOHANG);
+    if (r == pid || (r < 0 && errno != EINTR)) return 0;
+    if (timeout_ms >= 0 && now() >= end) return -1;
+    poll(NULL, 0, CHILD_POLL_MS);
+  }
 }
 
 /* errno values that mean the device/line has gone away */
@@ -876,7 +997,7 @@ static void cnd_process(const char *line)
       while (*semi && !strchr(PHONE_CHARS, *semi)) semi++;
       cnd_set_field(&called_nr, semi, PHONE_CHARS);
     }
-    if (buf[0]) cnd_set(&caller_id, buf);
+    cnd_set_field(&caller_id, buf, PHONE_CHARS);
     return;
   }
 
@@ -888,7 +1009,7 @@ static void cnd_process(const char *line)
   }
 
   if (strncmp(str, "CALLER NUMBER: ", 15) == 0) {
-    cnd_set(&caller_id, str + 15);
+    cnd_set_field(&caller_id, str + 15, PHONE_CHARS);
     return;
   }
 }
@@ -910,13 +1031,35 @@ static void cnd_feed(unsigned char c)
 /* chat: send / expect                                                */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Write all of buf, but never block for good: with RTS/CTS and CTS held low
+ * the tty stops sending and a plain write() would hang once its buffer fills.
+ * Wait for room with poll() (at most WRITE_TIMEOUT_MS without progress) and
+ * write small chunks that fit; a timeout fails like a write error. The fds
+ * stay blocking, since login shares the line's open file.
+ */
 static int write_full(int fd, const void *buf, size_t len)
 {
   const char *p = buf;
+  struct pollfd pfd;
+  long long deadline = now() + WRITE_TIMEOUT_MS, left;
   ssize_t n;
+  int r;
 
   while (len) {
-    n = write(fd, p, len);
+    left = deadline - now();
+    if (left <= 0) {
+      step("write timed out after %dms (flow control stuck?)", WRITE_TIMEOUT_MS);
+      errno = ETIMEDOUT;
+      return -1;
+    }
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    r = poll(&pfd, 1, left > POLL_SLICE_MS ? POLL_SLICE_MS : (int)left);
+    if (r < 0 && errno == EINTR) check_signal();
+    if (r <= 0) continue;
+    if (pfd.revents & (POLLERR | POLLNVAL)) return -1;
+    n = write(fd, p, len > WRITE_CHUNK ? WRITE_CHUNK : len);
     if (n < 0) {
       if (errno == EINTR) {
         check_signal();
@@ -927,6 +1070,7 @@ static int write_full(int fd, const void *buf, size_t len)
     if (n == 0) return -1; /* no progress: do not spin forever */
     p += n;
     len -= (size_t)n;
+    deadline = now() + WRITE_TIMEOUT_MS; /* progress: restart the timeout */
   }
   return 0;
 }
@@ -944,7 +1088,7 @@ static void chat_send(int fd, const char *p)
       if (*p == 'd') {
         if (n && write_full(fd, buf, n) < 0) return;
         n = 0;
-        usleep(CHAT_DELAY_US);
+        nap(CHAT_DELAY_MS);
         p++;
         continue;
       }
@@ -1054,7 +1198,8 @@ static void parse_connect_line(const char *line)
  * (briefly) until a numeric speed shows up. Any byte consumed here is
  * buffered in ppp_buf so it is not lost when the stream turns into PPP.
  *
- * returns 0 normally, -1 if the line was lost while scanning.
+ * returns CAPTURE_OK normally, CAPTURE_LOST if the line was lost while
+ * scanning, or CAPTURE_FULL if the replay buffer filled.
  */
 static int chat_capture_connect(int fd)
 {
@@ -1070,7 +1215,7 @@ static int chat_capture_connect(int fd)
   for (;;) {
     r = serial_read_char(fd, 300, &c);
 
-    if (r == SERIAL_LOST) return -1;
+    if (r == SERIAL_LOST) return CAPTURE_LOST;
     if (r == SERIAL_ERROR) break;
     if (r == SERIAL_TIMEOUT) {
       if (connect[0] && strpbrk(connect, DIGIT_CHARS)) break;
@@ -1078,7 +1223,9 @@ static int chat_capture_connect(int fd)
       continue;
     }
 
-    if (ppp_len < sizeof(ppp_buf)) ppp_buf[ppp_len++] = c;
+    /* keep every byte for pppd; drop the call if the buffer cannot hold it */
+    if (ppp_len >= sizeof(ppp_buf)) return CAPTURE_FULL;
+    ppp_buf[ppp_len++] = c;
 
     /* start of the PPP stream - stop scanning text (byte is kept) */
     if (c == PPP_FLAG) break;
@@ -1101,7 +1248,7 @@ static int chat_capture_connect(int fd)
     }
     if (line_len < sizeof(line) - 1) line[line_len++] = (char)c;
   }
-  return 0;
+  return CAPTURE_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1234,7 +1381,9 @@ static void set_env(const char *name, const char *val, int fatal)
 static void setup_environment(void)
 {
   if (caller_id && *caller_id) set_env("CALLER_ID", caller_id, 0);
+  else unsetenv("CALLER_ID");
   if (called_nr && *called_nr) set_env("CALLED_ID", called_nr, 0);
+  else unsetenv("CALLED_ID");
   if (opt_term && *opt_term) set_env("TERM", opt_term, 0);
   set_env("CONNECT", connect ? connect : "", 0);
   set_env("DEVICE", opt_device, 1);
@@ -1259,15 +1408,42 @@ static int switch_user(const char *user)
 enum relay_result {
   relay_closed = 0, /* pppd side closed, or a generic end */
   relay_idle,       /* PPP session idle too long */
-  relay_lost        /* serial device went away */
+  relay_lost,       /* serial device went away */
+  relay_exited      /* the watched child exited and was reaped */
 };
 
-/* shuttle data both ways between the real modem line and pppd's PTY. */
-static int relay_loop(int modem, int master, int idle_sec)
+/* pass the PTY's last output (e.g. "logout") on to the modem: until it has
+ * been quiet for CHILD_POLL_MS, at most LOGIN_DRAIN_MS */
+static void relay_drain(int master, int modem)
+{
+  struct pollfd pfd = {.fd = master, .events = POLLIN};
+  long long end = now() + LOGIN_DRAIN_MS;
+  unsigned char buf[4096];
+  ssize_t n;
+
+  while (now() < end && poll(&pfd, 1, CHILD_POLL_MS) > 0) {
+    n = read(master, buf, sizeof(buf));
+    if (n <= 0 || write_full(modem, buf, (size_t)n) < 0) return;
+  }
+}
+
+/*
+ * shuttle data both ways between the real modem line and the child's PTY.
+ * With watch (the PTY login), the relay ends when that child exits (reaped
+ * into *status), checked every CHILD_POLL_MS: a process the caller left
+ * running keeps the PTY open, so the master never hangs up by itself. A
+ * hangup on the master while the child runs is login's vhangup(), which
+ * closes every slave fd until login reopens its tty: the modem is not read
+ * during that gap, so the caller's input waits in the line; a gap longer than
+ * LOGIN_GAP_MS ends the relay. The idle timeout (idle_sec) counts only data
+ * from the modem: pppd's own keepalives (LCP echo) must not keep a call up
+ * the caller has gone quiet on.
+ */
+static int relay_loop(int modem, int master, int idle_sec, pid_t watch, int *status)
 {
   struct pollfd pfd[2];
   int r, timeout;
-  long long last_rx = now(), left;
+  long long last_rx = now(), left, gap_start = 0;
   ssize_t n;
   unsigned char buf[4096];
 
@@ -1279,10 +1455,17 @@ static int relay_loop(int modem, int master, int idle_sec)
   for (;;) {
     check_signal();
     timeout = POLL_SLICE_MS;
+    if (watch > 0) {
+      if (wait_child(watch, status, 0) == 0) {
+        relay_drain(master, modem);
+        return relay_exited;
+      }
+      timeout = CHILD_POLL_MS;
+    }
     if (idle_sec > 0) {
       left = (long long)idle_sec * 1000 - (now() - last_rx);
       if (left <= 0) {
-        step("no data for %d minute(s), hanging up", opt_ppp_idle_minutes);
+        step("no data from the caller for %d minute(s), hanging up", opt_ppp_idle_minutes);
         return relay_idle;
       }
       if (left < timeout) timeout = (int)left;
@@ -1298,6 +1481,25 @@ static int relay_loop(int modem, int master, int idle_sec)
     }
     if (r == 0) continue; /* idle deadline re-checked at the top */
 
+    if (pfd[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
+      n = read(master, buf, sizeof(buf));
+      if (n < 0 && errno == EINTR) {
+        check_signal();
+        continue;
+      }
+      if (n <= 0) {
+        if (watch <= 0) return relay_closed;
+        if (!gap_start) gap_start = now();
+        else if (now() - gap_start > LOGIN_GAP_MS) {
+          step("pty hung up for %dms with login still running, ending the relay", LOGIN_GAP_MS);
+          return relay_closed;
+        }
+        nap(CHILD_POLL_MS); /* the master stays hung up until the slave is reopened */
+        continue;
+      }
+      if (write_full(modem, buf, (size_t)n) < 0) return relay_lost;
+    }
+    gap_start = 0;
     if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
       n = read(modem, buf, sizeof(buf));
       if (n < 0 && errno == EINTR) {
@@ -1308,45 +1510,19 @@ static int relay_loop(int modem, int master, int idle_sec)
       last_rx = now();
       if (write_full(master, buf, (size_t)n) < 0) return relay_closed;
     }
-    if (pfd[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
-      n = read(master, buf, sizeof(buf));
-      if (n < 0 && errno == EINTR) {
-        check_signal();
-        continue;
-      }
-      if (n <= 0) return relay_closed;
-      last_rx = now();
-      if (write_full(modem, buf, (size_t)n) < 0) return relay_lost;
-    }
   }
 }
 
 /* reap a child, terminating it first and escalating to SIGKILL if needed */
 static void reap_child(pid_t pid, int *status, int terminate)
 {
-  long long deadline;
-  pid_t r;
-
-  *status = 0;
-  if (!terminate) {
-    while (waitpid(pid, status, 0) < 0 && errno == EINTR) check_signal();
-    return;
+  if (terminate) {
+    kill_child(pid, SIGTERM);
+    if (wait_child(pid, status, CHILD_TERM_MS) == 0) return;
+    step("child did not exit, sending SIGKILL");
+    kill_child(pid, SIGKILL);
   }
-
-  kill(pid, SIGTERM);
-  deadline = now() + CHILD_TERM_MS;
-  for (;;) {
-    r = waitpid(pid, status, WNOHANG);
-    if (r == pid || (r < 0 && errno != EINTR)) return;
-    if (now() >= deadline) {
-      step("child did not exit, sending SIGKILL");
-      kill(pid, SIGKILL);
-      break;
-    }
-    usleep(100000);
-    check_signal();
-  }
-  while (waitpid(pid, status, 0) < 0 && errno == EINTR) check_signal();
+  wait_child(pid, status, -1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1466,78 +1642,6 @@ static void create_pty(int *master_out, int *slave_out, char *slave_name, size_t
   *slave_out = slave;
 }
 
-/* fork a child on the PTY slave (its controlling terminal), optionally
- * dropping privileges, then exec cmd */
-static pid_t spawn_child(const char *cmd, char *argv[], int master, int slave, const char *runas)
-{
-  pid_t pid = fork();
-
-  if (pid < 0) die("fork failed: %s", strerror(errno));
-  if (pid == 0) {
-    setsid();
-    if (ioctl(slave, TIOCSCTTY, 0) < 0) die("cannot set controlling tty: %s", strerror(errno));
-    if (runas && switch_user(runas) != 0) _exit(1);
-    if (serial_fd >= 0) close(serial_fd);
-    if (master >= 0) close(master);
-    dup2(slave, STDIN_FILENO);
-    dup2(slave, STDOUT_FILENO);
-    dup2(slave, STDERR_FILENO);
-    fcntl(STDIN_FILENO, F_SETFD, 0);
-    fcntl(STDOUT_FILENO, F_SETFD, 0);
-    fcntl(STDERR_FILENO, F_SETFD, 0);
-    if (slave > STDERR_FILENO) close(slave);
-    execv(cmd, argv);
-    _exit(1);
-  }
-  return pid;
-}
-
-/*
- * Register `line` as a login process in utmp/wtmp (a getty does this; the
- * login program updates the entry to USER_PROCESS on success). The name is
- * taken without the leading "/dev/", matching login's ttyname. Best effort:
- * errors (e.g. non-root) are ignored.
- */
-static void put_utmp(const char *line)
-{
-  const char *tty = line;
-  struct utmpx ut;
-  struct timeval tv;
-  size_t n;
-
-  if (strncmp(tty, "/dev/", 5) == 0) tty += 5;
-  n = strlen(tty);
-
-  memset(&ut, 0, sizeof(ut));
-  ut.ut_type = LOGIN_PROCESS;
-  ut.ut_pid = getpid();
-  snprintf(ut.ut_line, sizeof(ut.ut_line), "%s", tty);
-  snprintf(ut.ut_id, sizeof(ut.ut_id), "%s", tty + (n > 4 ? n - 4 : 0));
-  snprintf(ut.ut_user, sizeof(ut.ut_user), "LOGIN");
-  if (caller_id && strcmp(caller_id, "none") != 0)
-    snprintf(ut.ut_host, sizeof(ut.ut_host), "%s", caller_id);
-  else if (connect) snprintf(ut.ut_host, sizeof(ut.ut_host), "%s", connect);
-  gettimeofday(&tv, NULL);
-  ut.ut_tv.tv_sec = (unsigned int)tv.tv_sec;
-  ut.ut_tv.tv_usec = (unsigned int)tv.tv_usec;
-
-  setutxent();
-  pututxline(&ut);
-  endutxent();
-  updwtmpx(_PATH_WTMP, &ut);
-}
-
-/*
- * Hand the line to the login program. If we are not already a session
- * leader (e.g. m2ppp was started from a shell), fork first so the child
- * can setsid() and take the tty as its controlling terminal.
- *
- * TIOCSCTTY is called with arg 0 ("don't steal"): if the tty is already
- * the controlling terminal of another session (a stale login/bash), the
- * ioctl fails with EPERM and we return -1 so the caller backs off rather
- * than stealing the line. Never returns on success.
- */
-
 /* make fd this process's stdin/stdout/stderr, clearing CLOEXEC on the copies
  * (dup2 is a no-op when oldfd == newfd, so fd 0 needs the explicit clear) */
 static void attach_tty(int fd)
@@ -1551,55 +1655,233 @@ static void attach_tty(int fd)
   if (fd > STDERR_FILENO) close(fd);
 }
 
+/* m2ppp ignores SIGPIPE and SIGALRM; an ignored signal stays ignored across
+ * exec, so give login/pppd (and the shells they start) the defaults back */
+static void reset_signals(void)
+{
+  signal(SIGALRM, SIG_DFL);
+  signal(SIGPIPE, SIG_DFL);
+}
+
+/* fork a child on the PTY slave (its controlling terminal), optionally
+ * dropping privileges, then exec cmd */
+static pid_t spawn_child(const char *cmd, char *argv[], int master, int slave, const char *runas)
+{
+  pid_t pid = fork();
+
+  if (pid < 0) die("fork failed: %s", strerror(errno));
+  if (pid == 0) {
+    setsid();
+    if (ioctl(slave, TIOCSCTTY, 0) < 0) die("cannot set controlling tty: %s", strerror(errno));
+    if (runas && switch_user(runas) != 0) _exit(1);
+    if (serial_fd >= 0) close(serial_fd);
+    if (master >= 0) close(master);
+    reset_signals();
+    attach_tty(slave);
+    execv(cmd, argv);
+    _exit(1);
+  }
+  return pid;
+}
+
+/*
+ * Start a utmp record of `type` for `line` and `pid`. The name is taken
+ * without the leading "/dev/", matching login's ttyname, and the id is its
+ * last 4 characters, so the records for one line replace each other.
+ */
+static void utmp_init(struct utmpx *ut, const char *line, short type, pid_t pid)
+{
+  const char *tty = line;
+  struct timeval tv;
+  size_t n;
+
+  if (strncmp(tty, "/dev/", 5) == 0) tty += 5;
+  n = strlen(tty);
+
+  memset(ut, 0, sizeof(*ut));
+  ut->ut_type = type;
+  ut->ut_pid = pid;
+  snprintf(ut->ut_line, sizeof(ut->ut_line), "%s", tty);
+  snprintf(ut->ut_id, sizeof(ut->ut_id), "%s", tty + (n > 4 ? n - 4 : 0));
+  gettimeofday(&tv, NULL);
+  ut->ut_tv.tv_sec = (unsigned int)tv.tv_sec;
+  ut->ut_tv.tv_usec = (unsigned int)tv.tv_usec;
+}
+
+/* write ut to utmp and append it to wtmp. Best effort: errors (e.g.
+ * non-root) are ignored. */
+static void utmp_write(const struct utmpx *ut)
+{
+  setutxent();
+  pututxline(ut);
+  endutxent();
+  updwtmpx(wtmp_path, ut);
+}
+
+/*
+ * Register `line` as a login process in utmp/wtmp (a getty does this; the
+ * login program updates the entry to USER_PROCESS on success).
+ */
+static void put_utmp(const char *line)
+{
+  struct utmpx ut;
+
+  utmp_init(&ut, line, LOGIN_PROCESS, getpid());
+  snprintf(ut.ut_user, sizeof(ut.ut_user), "LOGIN");
+  if (caller_id && strcmp(caller_id, "none") != 0)
+    snprintf(ut.ut_host, sizeof(ut.ut_host), "%s", caller_id);
+  else if (connect) snprintf(ut.ut_host, sizeof(ut.ut_host), "%s", connect);
+  utmp_write(&ut);
+}
+
+/*
+ * Mark the login session on `line` as ended (DEAD_PROCESS, with login's
+ * wait status), as init/getty do when login exits; otherwise who/w keep
+ * showing the user and last reports "still logged in".
+ */
+static void end_utmp(const char *line, pid_t pid, int status)
+{
+  struct utmpx ut;
+
+  utmp_init(&ut, line, DEAD_PROCESS, pid);
+  if (WIFEXITED(status)) ut.ut_exit.e_exit = (short)WEXITSTATUS(status);
+  else if (WIFSIGNALED(status)) ut.ut_exit.e_termination = (short)WTERMSIG(status);
+  utmp_write(&ut);
+}
+
+/*
+ * Hand the line to the login program and supervise it. We always fork so
+ * m2ppp stays the owner of the line: the child becomes a session leader,
+ * takes the tty as its controlling terminal, writes the utmp entry (with
+ * its own pid) and execs login; the parent waits for the session to end
+ * and then returns, so the state machine can hang up and wait for the
+ * next ring.
+ *
+ * TIOCSCTTY is called with arg 0 ("don't steal"): if the tty is already
+ * the controlling terminal of another session (a stale login/bash), the
+ * ioctl fails with EPERM, the child reports that over a pipe, and we
+ * return -1 so the caller backs off rather than stealing the line.
+ *
+ * The pipe carries one int: LOGIN_TTY_BUSY for the TIOCSCTTY failure, or
+ * the errno of a failed execv() so it can be logged here; nothing (EOF)
+ * once login has been exec'd.
+ */
+#define LOGIN_TTY_BUSY (-1)
+
 static int exec_login(int fd, const char *prog, char *const argv[])
 {
-  int status;
+  int pfd[2], status, err = 0;
+  ssize_t n;
   pid_t pid;
 
-  if (getsid(0) != getpid()) {
-    char err = 0;
-    int pfd[2];
-    ssize_t n;
-
-    if (pipe2(pfd, O_CLOEXEC) < 0) return -1;
-
-    pid = fork();
-    if (pid < 0) {
-      close(pfd[0]);
-      close(pfd[1]);
-      return -1;
-    }
-    if (pid == 0) {
-      char one = 1;
-
-      close(pfd[0]);
-      setsid();
-      if (ioctl(fd, TIOCSCTTY, 0) < 0) {
-        if (write(pfd[1], &one, 1) < 0) _exit(1);
-        _exit(1);
-      }
-      attach_tty(fd);
-      execv(prog, argv);
-      _exit(1);
-    }
-
-    close(pfd[1]);
-    n = read(pfd[0], &err, 1);
-    close(pfd[0]);
-    check_signal();
-    status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) check_signal();
-    if (n == 1 && err == 1) return -1; /* tty owned by another session */
-    _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 1);
+  /* a failure to start login is not a busy tty: report it and end the call */
+  if (pipe2(pfd, O_CLOEXEC) < 0) {
+    fprintf(stderr, "m2ppp: cannot start %s: %s\n", prog, strerror(errno));
+    return 0;
   }
 
-  setsid();
-  if (ioctl(fd, TIOCSCTTY, 0) < 0) return -1;
-  attach_tty(fd);
+  pid = fork();
+  if (pid < 0) {
+    fprintf(stderr, "m2ppp: cannot start %s: %s\n", prog, strerror(errno));
+    close(pfd[0]);
+    close(pfd[1]);
+    return 0;
+  }
+  if (pid == 0) {
+    close(pfd[0]);
+    setsid();
+    if (ioctl(fd, TIOCSCTTY, 0) < 0) {
+      err = LOGIN_TTY_BUSY;
+      if (write(pfd[1], &err, sizeof(err)) < 0) _exit(1);
+      _exit(1);
+    }
+    put_utmp(opt_device); /* the login process owns its pid and the tty now */
+    reset_signals();
+    attach_tty(fd);
+    execv(prog, argv);
+    err = errno;
+    if (write(pfd[1], &err, sizeof(err)) < 0) _exit(1);
+    _exit(1);
+  }
 
-  execv(prog, argv);
-  die("cannot execute %s: %s", prog, strerror(errno));
-  return -1;
+  child_pid = pid;
+  close(pfd[1]);
+  n = read(pfd[0], &err, sizeof(err)); /* EOF once the child execs (CLOEXEC closes pfd[1]) */
+  close(pfd[0]);
+  /* past TIOCSCTTY the child has written its utmp entry */
+  if (!(n == (ssize_t)sizeof(err) && err == LOGIN_TTY_BUSY)) child_utmp_line = opt_device;
+  wait_child(pid, &status, -1);
+  child_pid = -1;
+  child_utmp_line = NULL;
+
+  if (n == (ssize_t)sizeof(err) && err == LOGIN_TTY_BUSY) return -1; /* another session's tty */
+  end_utmp(opt_device, pid, status); /* the child wrote the entry before execv */
+  if (n == (ssize_t)sizeof(err)) {
+    fprintf(stderr, "m2ppp: cannot execute %s: %s\n", prog, strerror(err));
+    return 0;
+  }
+  step("login exited with status %d", WIFEXITED(status) ? WEXITSTATUS(status) : 1);
+  return 0;
+}
+
+/* close any previous fd, then open and configure the line. 0 on success. */
+static int open_line(void)
+{
+  int saved;
+
+  if (serial_fd >= 0) {
+    /* the flock belongs to the open file, which login (and anything it left
+     * running) shares through a dup: drop it, or that dup keeps the line
+     * locked against our own reopen. The UUCP lock still guards the line. */
+    flock(serial_fd, LOCK_UN);
+    tcflush(serial_fd, TCOFLUSH); /* unsent output (CTS low) would stall close() */
+    close(serial_fd);
+    serial_fd = -1;
+  }
+  step("opening %s", opt_device);
+  serial_fd = serial_open(opt_device);
+  if (serial_fd < 0) return -1;
+  if (serial_config(serial_fd, opt_baud) < 0) {
+    saved = errno;
+    close(serial_fd);
+    serial_fd = -1;
+    errno = saved;
+    return -1;
+  }
+  serial_flush_input(serial_fd); /* drop stale bytes from before the open */
+  step("line ready (%s, %d baud)", opt_device, opt_baud);
+  return 0;
+}
+
+/* the PAM service file login -h needs; M2PPP_PAM_REMOTE overrides it (tests) */
+static const char *pam_remote_file(void)
+{
+  const char *env = getenv("M2PPP_PAM_REMOTE");
+
+  return env && *env ? env : PAM_REMOTE_FILE;
+}
+
+/*
+ * -H: the remote host for login -h, i.e. the caller id's digits (a valid host
+ * name for logind, which shows it as FROM in w/who). NULL if there is no
+ * caller id, or if the PAM service file is missing: util-linux login uses the
+ * PAM service "remote" with -h, and without it every login would fail.
+ */
+static const char *login_remote_host(char *buf, size_t size)
+{
+  const char *p;
+  size_t n = 0;
+
+  if (!opt_remote_host || caller_id == NULL) return NULL;
+  for (p = caller_id; *p && n + 1 < size; p++)
+    if (isdigit((unsigned char)*p)) buf[n++] = *p;
+  buf[n] = '\0';
+  if (n == 0) return NULL;
+  if (access(pam_remote_file(), F_OK) < 0) {
+    step("%s missing, not passing the caller id to login (-H)", pam_remote_file());
+    return NULL;
+  }
+  return buf;
 }
 
 /*
@@ -1609,25 +1891,41 @@ static int exec_login(int fd, const char *prog, char *const argv[])
  */
 static int run_login(const char *name)
 {
-  char *argv[3];
-  const char *prog = opt_login, *slash;
+  char *argv[5], hostbuf[64];
+  const char *prog = opt_login, *slash, *host;
+  int argc = 0;
+  struct termios t;
 
   slash = strrchr(prog, '/');
-  argv[0] = (char *)(slash ? slash + 1 : prog);
-  argv[1] = (char *)name;
-  argv[2] = NULL;
+  argv[argc++] = (char *)(slash ? slash + 1 : prog);
+  host = login_remote_host(hostbuf, sizeof(hostbuf));
+  if (host) {
+    step("login remote host: %s", host);
+    argv[argc++] = (char *)"-h";
+    argv[argc++] = (char *)host;
+  }
+  argv[argc++] = (char *)name;
+  argv[argc] = NULL;
 
   step("login as '%s'", name);
 
-  /* exec login on the real line; on success this never returns. A busy tty
-   * (exec_login -1) is a back-off, not a lost line. */
+  /* Hand the line to login and stay its owner: the UUCP lock and the open fd
+   * are kept for the whole process, and exec_login() returns once the login
+   * session ends so the state machine hangs up and waits for the next ring.
+   * A busy tty (exec_login -1) is a back-off, not a lost line. */
   tio_mode_sane(serial_fd);
-  lock_remove();
   setup_environment();
-  put_utmp(opt_device);
   if (exec_login(serial_fd, prog, argv) < 0) {
     step("cannot take the tty for login (already in use)");
-    if (lock_line() < 0) die("cannot re-acquire lock after failed login");
+    return 0;
+  }
+
+  /* without the vhangup shim, login's vhangup() revoked our fd too (every
+   * ioctl now fails with EIO): reopen it so hangup_line() and the cooldown
+   * act on the real line, and only report a lost line if that fails */
+  if (tio_get(serial_fd, &t) < 0) {
+    step("line was hung up by login, reopening %s", opt_device);
+    if (open_line() < 0) return -1;
   }
   return 0;
 }
@@ -1663,6 +1961,9 @@ static int detect_type(int fd, int detect_sec, int prompt_sec, char *name, size_
   long long cur, deadline, prompt_at, wait_ms;
   size_t i, len = 0;
   unsigned char c;
+
+  if (name_max == 0) return DETECTED_DROP;
+  name_max--; /* reserve space for the terminating NUL */
 
   step("waiting for PPP frame (%ds; login prompt after %ds)", detect_sec, prompt_sec);
 
@@ -1702,7 +2003,11 @@ static int detect_type(int fd, int detect_sec, int prompt_sec, char *name, size_
     if (r == SERIAL_TIMEOUT) continue;
 
     /* keep the byte for pppd and keep detecting PPP */
-    if (ppp_len < sizeof(ppp_buf)) ppp_buf[ppp_len++] = c;
+    if (ppp_len >= sizeof(ppp_buf)) {
+      step("PPP replay buffer full, dropping the call");
+      return DETECTED_DROP;
+    }
+    ppp_buf[ppp_len++] = c;
     fr = ppp_feed(c);
     if (fr == 1) return DETECTED_PPP;
 
@@ -1719,6 +2024,12 @@ static int detect_type(int fd, int detect_sec, int prompt_sec, char *name, size_
     }
 
     if (c == '\r' || c == '\n') {
+      /* the name becomes login's argument: a leading '-' would be an option
+       * (-f skips authentication, -h fakes the remote host) */
+      if (len > 0 && name[0] == '-') {
+        step("login name starting with '-' rejected");
+        len = 0;
+      }
       if (len == 0) {
         write_full(fd, prompt, strlen(prompt));
         continue;
@@ -1763,11 +2074,56 @@ static void build_pppd_argv(char *argv[], char *opts_file, size_t opts_size)
   argv[argc] = NULL;
 }
 
+/*
+ * pppd flushes its tty's pending input when it sets the tty up (TCSAFLUSH,
+ * TCSETSF2 in pppd 2.5), so bytes written before that are lost and the peer
+ * has to retransmit its first LCP request (about 2s). The master is in packet
+ * mode (TIOCPKT) until here: the kernel reports that flush as
+ * TIOCPKT_FLUSHREAD, and the replay goes after it. Output pppd sends meanwhile
+ * (its own LCP request) is passed on to the modem. If no flush shows up within
+ * REPLAY_WAIT_MS, replay anyway. Returns -1 if writing to the modem failed
+ * (line lost or stuck), else 0.
+ */
+static int replay_after_flush(int master, int modem)
+{
+  unsigned char buf[4096];
+  struct pollfd pfd;
+  long long deadline = now() + REPLAY_WAIT_MS, left;
+  ssize_t n;
+  int off = 0;
+
+  for (;;) {
+    check_signal();
+    left = deadline - now();
+    if (left <= 0) {
+      step("pppd did not flush its tty within %dms, replaying anyway", REPLAY_WAIT_MS);
+      break;
+    }
+    pfd.fd = master;
+    pfd.events = POLLIN;
+    if (poll(&pfd, 1, (int)left) <= 0) continue; /* timeout or EINTR: re-check */
+    n = read(master, buf, sizeof(buf));
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) break; /* pppd is gone: the relay sees it too */
+    if (buf[0] == TIOCPKT_DATA) {
+      if (n > 1 && write_full(modem, buf + 1, (size_t)n - 1) < 0) return -1;
+    }
+    else if (buf[0] & TIOCPKT_FLUSHREAD) {
+      step("pppd flushed its tty");
+      break;
+    }
+  }
+  ioctl(master, TIOCPKT, &off); /* plain reads from here on (the relay) */
+  step("replaying %zu PPP byte(s) to pppd", ppp_len);
+  write_full(master, ppp_buf, ppp_len);
+  return 0;
+}
+
 static int run_pppd(void)
 {
   /* prog name + "modem" + MAX_PPPD_ARGS extras + "file" + path + NULL */
   char *argv[MAX_PPPD_ARGS + 5], opts_file[256], slave_name[128];
-  int master, slave, rc, status;
+  int master, slave, rc, status, on = 1;
   pid_t pid;
 
   setup_environment();
@@ -1775,18 +2131,27 @@ static int run_pppd(void)
 
   /* pppd runs on a PTY, so keep the lock on the real line while we relay */
   create_pty(&master, &slave, slave_name, sizeof(slave_name));
+  /* packet mode before pppd starts, so its tty flush is reported */
+  if (ppp_len && ioctl(master, TIOCPKT, &on) < 0) {
+    step("TIOCPKT: %s", strerror(errno));
+    on = 0;
+  }
   pid = spawn_child(opt_pppd, argv, master, slave, opt_runas);
   child_pid = pid;
 
   /* parent: relay */
   close(slave);
-  if (ppp_len) {
+  rc = relay_closed;
+  if (ppp_len && on && replay_after_flush(master, serial_fd) < 0) rc = relay_lost;
+  else if (ppp_len && !on) {
     step("replaying %zu PPP byte(s) to pppd", ppp_len);
     write_full(master, ppp_buf, ppp_len);
   }
 
-  step("pppd started, relaying");
-  rc = relay_loop(serial_fd, master, opt_ppp_idle_minutes * 60);
+  if (rc != relay_lost) {
+    step("pppd started, relaying");
+    rc = relay_loop(serial_fd, master, opt_ppp_idle_minutes * 60, 0, &status);
+  }
   if (rc == relay_idle || rc == relay_lost) {
     step(rc == relay_idle ? "idle timeout, terminating pppd"
                           : "serial line lost, terminating pppd");
@@ -1796,7 +2161,6 @@ static int run_pppd(void)
 
   step("pppd exited with status %d", WIFEXITED(status) ? WEXITSTATUS(status) : 1);
   close(master);
-  tio_hangup(serial_fd);
 
   return rc == relay_lost ? -1 : 0;
 }
@@ -1805,23 +2169,78 @@ static int run_pppd(void)
 /* call teardown                                                      */
 /* ------------------------------------------------------------------ */
 
-/* hang the call up (B0), then reset the line for the next one */
-static void hangup_line(void)
+/*
+ * Cut off every process that still has the line open, e.g. a background job
+ * the last caller left running, which could otherwise read the next call
+ * (RING, typed passwords). A child takes the tty as its controlling terminal
+ * and vhangup()s it: that revokes all open fds on it, ours included, so the
+ * line is reopened. Needs root (CAP_SYS_TTY_CONFIG). Returns 0 if revoked and
+ * reopened, 1 if not revoked (line unchanged), -1 if the reopen failed.
+ */
+static int revoke_line(void)
 {
+  int status;
+  pid_t pid;
+
+  /* without root vhangup() fails, and a child that took the tty and exits
+   * would still hang up a real serial line behind our back: skip it */
+  if (geteuid() != 0) {
+    step("cannot revoke %s: not running as root", opt_device);
+    return 1;
+  }
+  pid = fork();
+  if (pid < 0) {
+    step("cannot revoke %s: fork: %s", opt_device, strerror(errno));
+    return 1;
+  }
+  if (pid == 0) {
+    setsid();
+    if (ioctl(serial_fd, TIOCSCTTY, 1) < 0 || vhangup() < 0) _exit(errno ? errno : 1);
+    _exit(0);
+  }
+  wait_child(pid, &status, -1);
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    step("cannot revoke %s: %s", opt_device,
+         WIFEXITED(status) ? strerror(WEXITSTATUS(status)) : "child killed");
+    return 1;
+  }
+  step("revoked %s (vhangup), reopening", opt_device);
+  return open_line() < 0 ? -1 : 0;
+}
+
+/* hang the call up (B0), revoke leftover users of the line, then reset it for
+ * the next call. The callers re-send the init afterwards: a modem set to reset
+ * on DTR (&D3) is back at its stored profile and has lost E0/V1/#CID.
+ * Returns -1 if the line was lost (reopen after the revoke failed). */
+static int hangup_line(void)
+{
+  struct termios t;
+  int rc;
+
   step("hanging up");
-  if (serial_fd >= 0) {
+  if (serial_fd >= 0 && tio_get(serial_fd, &t) < 0) {
+    /* the tty was hung up already (DCD drop on the carrier-sensitive line):
+     * DTR is down and every fd on it, ours included, is revoked, so there is
+     * nothing left to hang up or revoke; just reopen */
+    step("line was hung up (carrier lost), reopening %s", opt_device);
+    if (open_line() < 0) return -1;
+  }
+  else if (serial_fd >= 0) {
     tio_hangup(serial_fd);
-    usleep(500000);
-    tio_raise(serial_fd, opt_baud);
+    nap(500);
+    rc = revoke_line();
+    if (rc < 0) return -1;
+    if (rc > 0) tio_raise(serial_fd, opt_baud); /* the reopen already set the line up */
     serial_flush_input(serial_fd);
   }
 
   /* optional cooldown before going back to "waiting for call" */
   if (opt_cooldown_seconds > 0) {
     step("cooling down for %d second(s) before next call", opt_cooldown_seconds);
-    sleep((unsigned int)opt_cooldown_seconds);
+    nap(opt_cooldown_seconds * 1000LL);
     if (serial_fd >= 0) serial_flush_input(serial_fd); /* drop RINGs meanwhile */
   }
+  return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1834,7 +2253,7 @@ static void usage(FILE *fp, const char *argv0)
           "usage: %s [-d dev] [-b baud] [-i init] [-a answer]\n"
           "          [-t sec] [-L lockdir] [-p pppd] [-g login] [-u user]\n"
           "          [-w sec] [-P sec] [-c sec] [-I min] [-r sec] [-o sec]\n"
-          "          [-T term] [-v] [-F] [-h] [-- pppd-args]\n",
+          "          [-T term] [-v] [-F] [-H] [-h] [-- pppd-args]\n",
           argv0);
 }
 
@@ -1852,20 +2271,35 @@ static int reopen_retry_seconds(void)
   return retry;
 }
 
+/* parse a required integer option; 0 on success, -1 on a malformed value */
+static int parse_int(const char *arg, int *out)
+{
+  char *end;
+  long val;
+
+  errno = 0;
+  val = strtol(arg, &end, 10);
+  if (errno != 0 || end == arg || *end != '\0' || val < INT_MIN || val > INT_MAX) return -1;
+  *out = (int)val;
+  return 0;
+}
+
 /* parse CLI options and remaining pppd arguments */
 static int parse_options(int argc, char **argv)
 {
   int c;
+  int bad;
 
   pppd_args[pppd_argc++] = (char *)"modem";
 
-  while ((c = getopt(argc, argv, "d:b:i:a:t:L:p:g:u:vFw:P:c:I:r:o:T:h")) != -1) {
+  while ((c = getopt(argc, argv, "d:b:i:a:t:L:p:g:u:vFHw:P:c:I:r:o:T:h")) != -1) {
+    bad = 0;
     switch (c) {
       case 'd':
         opt_device = optarg;
         break;
       case 'b':
-        opt_baud = atoi(optarg);
+        bad = parse_int(optarg, &opt_baud);
         break;
       case 'i':
         opt_init = optarg;
@@ -1874,7 +2308,7 @@ static int parse_options(int argc, char **argv)
         opt_answer = optarg;
         break;
       case 't':
-        opt_answer_seconds = atoi(optarg);
+        bad = parse_int(optarg, &opt_answer_seconds);
         break;
       case 'L':
         opt_lockdir = optarg;
@@ -1891,26 +2325,29 @@ static int parse_options(int argc, char **argv)
       case 'v':
         opt_verbose = 1;
         break;
+      case 'H':
+        opt_remote_host = 1;
+        break;
       case 'F':
         opt_no_optsfile = 1;
         break;
       case 'w':
-        opt_ppp_detect_seconds = atoi(optarg);
+        bad = parse_int(optarg, &opt_ppp_detect_seconds);
         break;
       case 'P':
-        opt_prompt_seconds = atoi(optarg);
+        bad = parse_int(optarg, &opt_prompt_seconds);
         break;
       case 'c':
-        opt_cooldown_seconds = atoi(optarg);
+        bad = parse_int(optarg, &opt_cooldown_seconds);
         break;
       case 'I':
-        opt_ppp_idle_minutes = atoi(optarg);
+        bad = parse_int(optarg, &opt_ppp_idle_minutes);
         break;
       case 'r':
-        opt_reinit_seconds = atoi(optarg);
+        bad = parse_int(optarg, &opt_reinit_seconds);
         break;
       case 'o':
-        opt_init_ok_seconds = atoi(optarg);
+        bad = parse_int(optarg, &opt_init_ok_seconds);
         break;
       case 'T':
         opt_term = optarg;
@@ -1921,6 +2358,10 @@ static int parse_options(int argc, char **argv)
       default:
         usage(stderr, argv[0]);
         return -1;
+    }
+    if (bad) {
+      usage(stderr, argv[0]);
+      return -1;
     }
   }
 
@@ -1942,34 +2383,15 @@ static int parse_options(int argc, char **argv)
     usage(stderr, argv[0]);
     return -1;
   }
-  return 0;
-}
-
-/* close any previous fd, then open and configure the line. 0 on success. */
-static int open_line(void)
-{
-  int saved;
-
-  if (serial_fd >= 0) {
-    close(serial_fd);
-    serial_fd = -1;
-  }
-  step("opening %s", opt_device);
-  serial_fd = serial_open(opt_device);
-  if (serial_fd < 0) return -1;
-  if (serial_config(serial_fd, opt_baud) < 0) {
-    saved = errno;
-    close(serial_fd);
-    serial_fd = -1;
-    errno = saved;
+  /* -u is used per call, after fork: catch a bad user name now */
+  if (opt_runas && getpwnam(opt_runas) == NULL) {
+    fprintf(stderr, "m2ppp: unknown user '%s' (-u)\n", opt_runas);
     return -1;
   }
-  serial_flush_input(serial_fd); /* drop stale bytes from before the open */
-  step("line ready (%s, %d baud)", opt_device, opt_baud);
   return 0;
 }
 
-/* cycle through the call states until pppd is exec()ed or an error */
+/* cycle through the call states until a fatal error or a signal */
 static int run_state_machine(void)
 {
   enum m2ppp_state state = st_init;
@@ -1983,7 +2405,7 @@ static int run_state_machine(void)
         if (open_line() < 0) {
           retry = reopen_retry_seconds();
           step("line not available, retrying in %ds", retry);
-          sleep((unsigned int)retry);
+          nap(retry * 1000LL);
           state = st_open;
         }
         else {
@@ -2010,6 +2432,12 @@ static int run_state_machine(void)
           state = st_open;
         }
         else {
+          /* an ERROR comes back at once: wait as long as a missing OK would,
+           * or a rejected init string is re-sent in a tight loop */
+          if (rc == WAIT_ABORT) {
+            step("modem rejected init, retrying in %ds", opt_init_ok_seconds);
+            nap(opt_init_ok_seconds * 1000LL);
+          }
           step("no OK after init, reopening line");
           state = st_open;
         }
@@ -2044,16 +2472,21 @@ static int run_state_machine(void)
         }
         if (rc != CHAT_MATCH) {
           step("no CONNECT (rc=%d)", rc);
-          hangup_line();
-          state = st_waiting;
+          state = hangup_line() < 0 ? st_open : st_init;
           break;
         }
-        if (chat_capture_connect(serial_fd) < 0) {
+        rc = chat_capture_connect(serial_fd);
+        if (rc == CAPTURE_LOST) {
           state = st_open;
           break;
         }
+        if (rc == CAPTURE_FULL) {
+          step("PPP replay buffer full during CONNECT, hanging up");
+          state = hangup_line() < 0 ? st_open : st_init;
+          break;
+        }
         step("CONNECT: %s", connect[0] ? connect : "(no speed)");
-        serial_set_hardflow(serial_fd);
+        serial_set_call_mode(serial_fd);
         state = st_detect_ppp;
         break;
       }
@@ -2073,8 +2506,7 @@ static int run_state_machine(void)
         }
         else {
           step("login/PPP timed out, hanging up");
-          hangup_line();
-          state = st_waiting;
+          state = hangup_line() < 0 ? st_open : st_init;
         }
         break;
 
@@ -2082,8 +2514,7 @@ static int run_state_machine(void)
         write_full(serial_fd, "\r\n", 2);
         if (run_login(login_name) < 0) state = st_open; /* line lost */
         else {
-          hangup_line();
-          state = st_waiting;
+          state = hangup_line() < 0 ? st_open : st_init;
         }
         break;
 
@@ -2091,8 +2522,7 @@ static int run_state_machine(void)
         step("handing over to pppd");
         if (run_pppd() < 0) state = st_open; /* line lost during the session */
         else {
-          hangup_line();
-          state = st_waiting;
+          state = hangup_line() < 0 ? st_open : st_init;
         }
         break;
 
@@ -2109,11 +2539,17 @@ int main(int argc, char **argv)
 {
   int rc, saved;
 
+  main_pid = getpid();
   rc = parse_options(argc, argv);
   if (rc > 0) return 0; /* -h: usage already printed */
   if (rc < 0) return 1;
 
   step("m2ppp built %s %s", __DATE__, __TIME__);
+  if (opt_remote_host && access(pam_remote_file(), F_OK) < 0)
+    fprintf(stderr,
+            "m2ppp: warning: -H needs %s (login -h uses the PAM service \"remote\"); "
+            "the caller id is not passed to login until it exists\n",
+            pam_remote_file());
 
   install_signal(SIGINT);
   install_signal(SIGTERM);
@@ -2132,13 +2568,11 @@ int main(int argc, char **argv)
   if (lock_line() < 0) return 1;
   if (open_line() < 0) {
     saved = errno;
-    lock_remove();
     die("cannot open %s: %s", opt_device, strerror(saved));
   }
 
   rc = run_state_machine();
 
-  if (serial_fd >= 0) close(serial_fd);
-  lock_remove();
+  shutdown_call();
   return rc;
 }
