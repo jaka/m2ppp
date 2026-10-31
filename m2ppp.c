@@ -99,6 +99,7 @@
 #define CHILD_POLL_MS 100
 #define LOGIN_GAP_MS 5000
 #define LOGIN_DRAIN_MS 1000
+#define LOGIN_EOL_MS 50
 #define CONNECT_CAPTURE_MS 2000
 #define POLL_SLICE_MS 1500
 /* longest wait for pppd to set up (and flush) its tty before the replay */
@@ -155,13 +156,14 @@
 #define CHAT_ABORT (-2)
 #define CHAT_LOST (-3) /* line lost while waiting */
 
-/* wait_ring_or_ok() results (SERIAL_LOST on device loss) */
+/* wait_ring_or_ok() results */
 #define WAIT_OK 0
 #define WAIT_RING 1
 #define WAIT_ABORT 2
 #define WAIT_TIMEOUT (-1)
+#define WAIT_LOST (-2) /* line lost while waiting */
 
-/* detect_type() results (SERIAL_LOST on device loss) */
+/* detect_type() results */
 #define DETECTED_DROP 0    /* timeout/abort: drop the call        */
 #define DETECTED_PPP 1     /* PPP frame seen: run pppd            */
 #define DETECTED_LOGIN 2   /* login name entered: run the login   */
@@ -171,6 +173,12 @@
 #define CAPTURE_OK 0
 #define CAPTURE_LOST (-1) /* line lost while scanning             */
 #define CAPTURE_FULL (-2) /* PPP replay buffer filled: drop the call */
+
+/* relay_loop() results */
+#define RELAY_CLOSED 0 /* pppd side closed, or a generic end */
+#define RELAY_IDLE 1   /* PPP session idle too long */
+#define RELAY_LOST 2   /* serial device went away */
+#define RELAY_EXITED 3 /* the watched child exited and was reaped */
 
 /* termios flow control */
 #define FLOW_NONE 0
@@ -793,8 +801,8 @@ static void install_signal(int sig)
  * entry, drop the lock */
 static void shutdown_call(void)
 {
-  pid_t pid = child_pid;
   int status;
+  pid_t pid = child_pid;
 
   if (serial_fd >= 0) {
     tcflush(serial_fd, TCOFLUSH); /* or the exit's close() waits for CTS */
@@ -874,9 +882,9 @@ static int serial_gone(int err)
  */
 static int serial_read_char(int fd, int timeout_ms, unsigned char *c)
 {
-  struct pollfd pfd = {.fd = fd, .events = POLLIN};
-  long long end = now() + timeout_ms, left;
   int r, wait;
+  long long end = now() + timeout_ms, left;
+  struct pollfd pfd = {.fd = fd, .events = POLLIN};
 
   for (;;) {
     check_signal();
@@ -1041,10 +1049,10 @@ static void cnd_feed(unsigned char c)
 static int write_full(int fd, const void *buf, size_t len)
 {
   const char *p = buf;
-  struct pollfd pfd;
+  int r;
   long long deadline = now() + WRITE_TIMEOUT_MS, left;
   ssize_t n;
-  int r;
+  struct pollfd pfd;
 
   while (len) {
     left = deadline - now();
@@ -1129,7 +1137,9 @@ static int is_abort_line(const char *buf, size_t len)
   return 0;
 }
 
-/* returns CHAT_MATCH, CHAT_ERROR, CHAT_ABORT or CHAT_LOST */
+/* returns CHAT_MATCH, CHAT_ERROR, CHAT_ABORT or CHAT_LOST. The deadline is
+ * checked before every byte, so a line that keeps sending (noise, a caller's
+ * data) cannot hold off the timeout. */
 static int chat_expect(int fd, const char *expect, int timeout_sec)
 {
   char match[512];
@@ -1139,14 +1149,12 @@ static int chat_expect(int fd, const char *expect, int timeout_sec)
   unsigned char c;
 
   for (;;) {
-    r = serial_read_char(fd, 1000, &c);
+    if (now() >= deadline) return CHAT_ERROR;
+    r = serial_read_char(fd, (int)(deadline - now()), &c);
 
     if (r == SERIAL_LOST) return CHAT_LOST;
     if (r == SERIAL_ERROR) return CHAT_ERROR;
-    if (r == SERIAL_TIMEOUT) {
-      if (now() >= deadline) return CHAT_ERROR;
-      continue;
-    }
+    if (r == SERIAL_TIMEOUT) continue; /* the deadline is re-checked at the top */
 
     cnd_feed(c);
 
@@ -1197,6 +1205,8 @@ static void parse_connect_line(const char *line)
  * speed on the same line, others on a following line, so keep scanning
  * (briefly) until a numeric speed shows up. Any byte consumed here is
  * buffered in ppp_buf so it is not lost when the stream turns into PPP.
+ * Like chat_expect(), the deadline is checked before every byte, so a caller
+ * that keeps sending (CRs, keystrokes) cannot stretch the scan.
  *
  * returns CAPTURE_OK normally, CAPTURE_LOST if the line was lost while
  * scanning, or CAPTURE_FULL if the replay buffer filled.
@@ -1213,14 +1223,14 @@ static int chat_capture_connect(int fd)
   cnd_len = 0; /* drop any partial line left over from chat_expect() */
 
   for (;;) {
+    if (now() >= deadline) break;
     r = serial_read_char(fd, 300, &c);
 
     if (r == SERIAL_LOST) return CAPTURE_LOST;
     if (r == SERIAL_ERROR) break;
     if (r == SERIAL_TIMEOUT) {
       if (connect[0] && strpbrk(connect, DIGIT_CHARS)) break;
-      if (now() >= deadline) break;
-      continue;
+      continue; /* the deadline is re-checked at the top */
     }
 
     /* keep every byte for pppd; drop the call if the buffer cannot hold it */
@@ -1269,8 +1279,9 @@ static int is_ring_line(const char *line)
  *           WAIT_OK      on an "OK" line
  *           WAIT_ABORT   on a modem action line (ERROR, NO CARRIER, ...)
  *           WAIT_TIMEOUT on timeout / error
- *           SERIAL_LOST  if the line went away
- * timeout_ms < 0 waits forever.
+ *           WAIT_LOST    if the line went away
+ * timeout_ms < 0 waits forever. Like chat_expect(), the deadline is checked
+ * before every byte, so a line that keeps sending cannot hold it off.
  */
 static int wait_ring_or_ok(int fd, int timeout_ms)
 {
@@ -1283,14 +1294,12 @@ static int wait_ring_or_ok(int fd, int timeout_ms)
   reset_call_data(); /* clean slate before any RING is parsed */
 
   for (;;) {
-    r = serial_read_char(fd, 1000, &c);
+    if (timeout_ms >= 0 && now() >= deadline) return WAIT_TIMEOUT;
+    r = serial_read_char(fd, timeout_ms >= 0 ? (int)(deadline - now()) : INT_MAX, &c);
 
-    if (r == SERIAL_LOST) return SERIAL_LOST;
+    if (r == SERIAL_LOST) return WAIT_LOST;
     if (r == SERIAL_ERROR) return WAIT_TIMEOUT;
-    if (r == SERIAL_TIMEOUT) {
-      if (timeout_ms >= 0 && now() >= deadline) return WAIT_TIMEOUT;
-      continue;
-    }
+    if (r == SERIAL_TIMEOUT) continue; /* the deadline is re-checked at the top */
 
     if (c != '\r' && c != '\n') {
       if (line_len == 0 && isspace(c)) continue;
@@ -1405,21 +1414,14 @@ static int switch_user(const char *user)
   return 0;
 }
 
-enum relay_result {
-  relay_closed = 0, /* pppd side closed, or a generic end */
-  relay_idle,       /* PPP session idle too long */
-  relay_lost,       /* serial device went away */
-  relay_exited      /* the watched child exited and was reaped */
-};
-
 /* pass the PTY's last output (e.g. "logout") on to the modem: until it has
  * been quiet for CHILD_POLL_MS, at most LOGIN_DRAIN_MS */
 static void relay_drain(int master, int modem)
 {
-  struct pollfd pfd = {.fd = master, .events = POLLIN};
   long long end = now() + LOGIN_DRAIN_MS;
-  unsigned char buf[4096];
   ssize_t n;
+  struct pollfd pfd = {.fd = master, .events = POLLIN};
+  unsigned char buf[4096];
 
   while (now() < end && poll(&pfd, 1, CHILD_POLL_MS) > 0) {
     n = read(master, buf, sizeof(buf));
@@ -1441,10 +1443,10 @@ static void relay_drain(int master, int modem)
  */
 static int relay_loop(int modem, int master, int idle_sec, pid_t watch, int *status)
 {
-  struct pollfd pfd[2];
   int r, timeout;
-  long long last_rx = now(), left, gap_start = 0;
+  long long gap_start = 0, last_rx = now(), left;
   ssize_t n;
+  struct pollfd pfd[2];
   unsigned char buf[4096];
 
   pfd[0].fd = modem;
@@ -1458,7 +1460,7 @@ static int relay_loop(int modem, int master, int idle_sec, pid_t watch, int *sta
     if (watch > 0) {
       if (wait_child(watch, status, 0) == 0) {
         relay_drain(master, modem);
-        return relay_exited;
+        return RELAY_EXITED;
       }
       timeout = CHILD_POLL_MS;
     }
@@ -1466,7 +1468,7 @@ static int relay_loop(int modem, int master, int idle_sec, pid_t watch, int *sta
       left = (long long)idle_sec * 1000 - (now() - last_rx);
       if (left <= 0) {
         step("no data from the caller for %d minute(s), hanging up", opt_ppp_idle_minutes);
-        return relay_idle;
+        return RELAY_IDLE;
       }
       if (left < timeout) timeout = (int)left;
     }
@@ -1477,7 +1479,7 @@ static int relay_loop(int modem, int master, int idle_sec, pid_t watch, int *sta
         check_signal();
         continue;
       }
-      return relay_closed;
+      return RELAY_CLOSED;
     }
     if (r == 0) continue; /* idle deadline re-checked at the top */
 
@@ -1488,16 +1490,16 @@ static int relay_loop(int modem, int master, int idle_sec, pid_t watch, int *sta
         continue;
       }
       if (n <= 0) {
-        if (watch <= 0) return relay_closed;
+        if (watch <= 0) return RELAY_CLOSED;
         if (!gap_start) gap_start = now();
         else if (now() - gap_start > LOGIN_GAP_MS) {
           step("pty hung up for %dms with login still running, ending the relay", LOGIN_GAP_MS);
-          return relay_closed;
+          return RELAY_CLOSED;
         }
         nap(CHILD_POLL_MS); /* the master stays hung up until the slave is reopened */
         continue;
       }
-      if (write_full(modem, buf, (size_t)n) < 0) return relay_lost;
+      if (write_full(modem, buf, (size_t)n) < 0) return RELAY_LOST;
     }
     gap_start = 0;
     if (pfd[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
@@ -1506,22 +1508,20 @@ static int relay_loop(int modem, int master, int idle_sec, pid_t watch, int *sta
         check_signal();
         continue;
       }
-      if (n <= 0) return relay_lost;
+      if (n <= 0) return RELAY_LOST;
       last_rx = now();
-      if (write_full(master, buf, (size_t)n) < 0) return relay_closed;
+      if (write_full(master, buf, (size_t)n) < 0) return RELAY_CLOSED;
     }
   }
 }
 
-/* reap a child, terminating it first and escalating to SIGKILL if needed */
-static void reap_child(pid_t pid, int *status, int terminate)
+/* terminate and reap a child, escalating to SIGKILL if needed */
+static void reap_child(pid_t pid, int *status)
 {
-  if (terminate) {
-    kill_child(pid, SIGTERM);
-    if (wait_child(pid, status, CHILD_TERM_MS) == 0) return;
-    step("child did not exit, sending SIGKILL");
-    kill_child(pid, SIGKILL);
-  }
+  kill_child(pid, SIGTERM);
+  if (wait_child(pid, status, CHILD_TERM_MS) == 0) return;
+  step("child did not exit, sending SIGKILL");
+  kill_child(pid, SIGKILL);
   wait_child(pid, status, -1);
 }
 
@@ -1673,7 +1673,9 @@ static pid_t spawn_child(const char *cmd, char *argv[], int master, int slave, c
   if (pid == 0) {
     setsid();
     if (ioctl(slave, TIOCSCTTY, 0) < 0) die("cannot set controlling tty: %s", strerror(errno));
-    if (runas && switch_user(runas) != 0) _exit(1);
+    errno = 0; /* getpwnam() leaves it 0 for an unknown user */
+    if (runas && switch_user(runas) != 0)
+      die("cannot run as user '%s' (-u): %s", runas, errno ? strerror(errno) : "no such user");
     if (serial_fd >= 0) close(serial_fd);
     if (master >= 0) close(master);
     reset_signals();
@@ -1692,8 +1694,8 @@ static pid_t spawn_child(const char *cmd, char *argv[], int master, int slave, c
 static void utmp_init(struct utmpx *ut, const char *line, short type, pid_t pid)
 {
   const char *tty = line;
-  struct timeval tv;
   size_t n;
+  struct timeval tv;
 
   if (strncmp(tty, "/dev/", 5) == 0) tty += 5;
   n = strlen(tty);
@@ -1770,9 +1772,9 @@ static void end_utmp(const char *line, pid_t pid, int status)
 
 static int exec_login(int fd, const char *prog, char *const argv[])
 {
-  int pfd[2], status, err = 0;
-  ssize_t n;
+  int err = 0, pfd[2], status;
   pid_t pid;
+  ssize_t n;
 
   /* a failure to start login is not a busy tty: report it and end the call */
   if (pipe2(pfd, O_CLOEXEC) < 0) {
@@ -1886,13 +1888,13 @@ static const char *login_remote_host(char *buf, size_t size)
 
 /*
  * Run the login program for `name` (the st_exec_login handoff).
- * Returns 0 when the session ended (or the tty was busy), -1 if the line was
- * lost and the caller should reopen it.
+ * The caller hangs up afterwards; hangup_line() also copes with a line that
+ * was lost or hung up during the session.
  */
-static int run_login(const char *name)
+static void run_login(const char *name)
 {
   char *argv[5], hostbuf[64];
-  const char *prog = opt_login, *slash, *host;
+  const char *host, *prog = opt_login, *slash;
   int argc = 0;
   struct termios t;
 
@@ -1917,17 +1919,17 @@ static int run_login(const char *name)
   setup_environment();
   if (exec_login(serial_fd, prog, argv) < 0) {
     step("cannot take the tty for login (already in use)");
-    return 0;
+    return;
   }
 
   /* without the vhangup shim, login's vhangup() revoked our fd too (every
    * ioctl now fails with EIO): reopen it so hangup_line() and the cooldown
-   * act on the real line, and only report a lost line if that fails */
+   * act on the real line (a failed reopen leaves serial_fd -1, which
+   * hangup_line() reports as a lost line) */
   if (tio_get(serial_fd, &t) < 0) {
     step("line was hung up by login, reopening %s", opt_device);
-    if (open_line() < 0) return -1;
+    open_line();
   }
-  return 0;
 }
 
 /* show issue/banner + hostname login prompt (+ pre-prompt typing) */
@@ -2024,6 +2026,8 @@ static int detect_type(int fd, int detect_sec, int prompt_sec, char *name, size_
     }
 
     if (c == '\r' || c == '\n') {
+      /* a CR LF terminal's LF: the CR already ended the line (or re-prompted) */
+      if (c == '\n' && ppp_len >= 2 && ppp_buf[ppp_len - 2] == '\r') continue;
       /* the name becomes login's argument: a leading '-' would be an option
        * (-f skips authentication, -h fakes the remote host) */
       if (len > 0 && name[0] == '-') {
@@ -2086,11 +2090,11 @@ static void build_pppd_argv(char *argv[], char *opts_file, size_t opts_size)
  */
 static int replay_after_flush(int master, int modem)
 {
-  unsigned char buf[4096];
-  struct pollfd pfd;
+  int off = 0;
   long long deadline = now() + REPLAY_WAIT_MS, left;
   ssize_t n;
-  int off = 0;
+  struct pollfd pfd;
+  unsigned char buf[4096];
 
   for (;;) {
     check_signal();
@@ -2119,11 +2123,13 @@ static int replay_after_flush(int master, int modem)
   return 0;
 }
 
-static int run_pppd(void)
+/* run pppd on a PTY and relay the call to it; the caller hangs up afterwards
+ * (hangup_line() also copes with a line that was lost during the session) */
+static void run_pppd(void)
 {
   /* prog name + "modem" + MAX_PPPD_ARGS extras + "file" + path + NULL */
   char *argv[MAX_PPPD_ARGS + 5], opts_file[256], slave_name[128];
-  int master, slave, rc, status, on = 1;
+  int master, on = 1, rc, slave, status;
   pid_t pid;
 
   setup_environment();
@@ -2141,28 +2147,41 @@ static int run_pppd(void)
 
   /* parent: relay */
   close(slave);
-  rc = relay_closed;
-  if (ppp_len && on && replay_after_flush(master, serial_fd) < 0) rc = relay_lost;
+  rc = RELAY_CLOSED;
+  if (ppp_len && on && replay_after_flush(master, serial_fd) < 0) rc = RELAY_LOST;
   else if (ppp_len && !on) {
     step("replaying %zu PPP byte(s) to pppd", ppp_len);
     write_full(master, ppp_buf, ppp_len);
   }
 
-  if (rc != relay_lost) {
+  if (rc != RELAY_LOST) {
     step("pppd started, relaying");
     rc = relay_loop(serial_fd, master, opt_ppp_idle_minutes * 60, 0, &status);
   }
-  if (rc == relay_idle || rc == relay_lost) {
-    step(rc == relay_idle ? "idle timeout, terminating pppd"
-                          : "serial line lost, terminating pppd");
+  /* a lost line: close pppd's tty, so it sees a modem hangup and exits at
+   * once; a SIGTERM would make it send LCP TermReqs into the dead line and
+   * wait for the acks. An idle timeout gets the SIGTERM: the caller is still
+   * there for the LCP terminate. */
+  if (rc == RELAY_LOST) {
+    step("serial line lost, closing pppd's tty");
+    close(master);
+    master = -1;
   }
-  reap_child(pid, &status, rc == relay_idle || rc == relay_lost);
+  else if (rc == RELAY_IDLE) step("idle timeout, terminating pppd");
+  /* pppd closing its tty (RELAY_CLOSED) is normally on its way out, but a
+   * relay can also end that way with pppd still running (a write to the PTY
+   * timed out): a hung pppd must not hold the call, so give it CHILD_TERM_MS
+   * to exit, then end it */
+  if (rc == RELAY_CLOSED || rc == RELAY_LOST) {
+    if (wait_child(pid, &status, CHILD_TERM_MS) == 0) rc = RELAY_EXITED;
+    else step("pppd still running %dms after the relay ended, terminating it", CHILD_TERM_MS);
+  }
+  if (rc != RELAY_EXITED) reap_child(pid, &status);
   child_pid = -1;
 
-  step("pppd exited with status %d", WIFEXITED(status) ? WEXITSTATUS(status) : 1);
-  close(master);
-
-  return rc == relay_lost ? -1 : 0;
+  if (WIFEXITED(status)) step("pppd exited with status %d", WEXITSTATUS(status));
+  else step("pppd killed by signal %d", WTERMSIG(status));
+  if (master >= 0) close(master);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2211,21 +2230,24 @@ static int revoke_line(void)
 /* hang the call up (B0), revoke leftover users of the line, then reset it for
  * the next call. The callers re-send the init afterwards: a modem set to reset
  * on DTR (&D3) is back at its stored profile and has lost E0/V1/#CID.
- * Returns -1 if the line was lost (reopen after the revoke failed). */
+ * A call that ended with the line lost (carrier drop, RELAY_LOST) comes here
+ * too, so the -c cooldown applies to every call end. Returns -1 if the line
+ * is lost (no fd, or a reopen failed). */
 static int hangup_line(void)
 {
-  struct termios t;
   int rc;
+  struct termios t;
 
+  if (serial_fd < 0) return -1; /* a reopen during the call failed */
   step("hanging up");
-  if (serial_fd >= 0 && tio_get(serial_fd, &t) < 0) {
+  if (tio_get(serial_fd, &t) < 0) {
     /* the tty was hung up already (DCD drop on the carrier-sensitive line):
      * DTR is down and every fd on it, ours included, is revoked, so there is
      * nothing left to hang up or revoke; just reopen */
     step("line was hung up (carrier lost), reopening %s", opt_device);
     if (open_line() < 0) return -1;
   }
-  else if (serial_fd >= 0) {
+  else {
     tio_hangup(serial_fd);
     nap(500);
     rc = revoke_line();
@@ -2238,7 +2260,7 @@ static int hangup_line(void)
   if (opt_cooldown_seconds > 0) {
     step("cooling down for %d second(s) before next call", opt_cooldown_seconds);
     nap(opt_cooldown_seconds * 1000LL);
-    if (serial_fd >= 0) serial_flush_input(serial_fd); /* drop RINGs meanwhile */
+    serial_flush_input(serial_fd); /* drop RINGs meanwhile */
   }
   return 0;
 }
@@ -2287,8 +2309,7 @@ static int parse_int(const char *arg, int *out)
 /* parse CLI options and remaining pppd arguments */
 static int parse_options(int argc, char **argv)
 {
-  int c;
-  int bad;
+  int bad, c;
 
   pppd_args[pppd_argc++] = (char *)"modem";
 
@@ -2394,8 +2415,8 @@ static int parse_options(int argc, char **argv)
 /* cycle through the call states until a fatal error or a signal */
 static int run_state_machine(void)
 {
-  enum m2ppp_state state = st_init;
   char login_name[128];
+  enum m2ppp_state state = st_init;
   int rc, retry;
 
   while (state != st_unknown) {
@@ -2428,7 +2449,7 @@ static int run_state_machine(void)
         else if (rc == WAIT_RING) {
           state = st_answer_phone;
         }
-        else if (rc == SERIAL_LOST) {
+        else if (rc == WAIT_LOST) {
           state = st_open;
         }
         else {
@@ -2452,7 +2473,7 @@ static int run_state_machine(void)
         else if (rc == WAIT_OK) {
           state = st_waiting; /* modem alive: reset the check timer */
         }
-        else if (rc == SERIAL_LOST) {
+        else if (rc == WAIT_LOST) {
           step("serial line lost");
           state = st_open;
         }
@@ -2501,29 +2522,24 @@ static int run_state_machine(void)
         else if (rc == DETECTED_LOGIN) {
           state = st_exec_login;
         }
-        else if (rc == DETECTED_LOST) {
-          state = st_open;
-        }
         else {
-          step("login/PPP timed out, hanging up");
+          /* a lost line (carrier drop) goes through hangup_line() too: it
+           * reopens the line, and the -c cooldown still applies */
+          if (rc != DETECTED_LOST) step("login/PPP timed out, hanging up");
           state = hangup_line() < 0 ? st_open : st_init;
         }
         break;
 
       case st_exec_login:
         write_full(serial_fd, "\r\n", 2);
-        if (run_login(login_name) < 0) state = st_open; /* line lost */
-        else {
-          state = hangup_line() < 0 ? st_open : st_init;
-        }
+        run_login(login_name);
+        state = hangup_line() < 0 ? st_open : st_init;
         break;
 
       case st_exec_ppp:
         step("handing over to pppd");
-        if (run_pppd() < 0) state = st_open; /* line lost during the session */
-        else {
-          state = hangup_line() < 0 ? st_open : st_init;
-        }
+        run_pppd();
+        state = hangup_line() < 0 ? st_open : st_init;
         break;
 
       case st_unknown:
@@ -2538,6 +2554,7 @@ static int run_state_machine(void)
 int main(int argc, char **argv)
 {
   int rc, saved;
+  struct stat st;
 
   main_pid = getpid();
   rc = parse_options(argc, argv);
@@ -2565,6 +2582,10 @@ int main(int argc, char **argv)
    * missing device) is visible instead of spinning here forever. Once
    * running, a device that disappears is re-opened by st_open/st_init.
    */
+  if (stat(opt_device, &st) < 0) {
+    saved = errno;
+    die("cannot open %s: %s", opt_device, strerror(saved));
+  }
   if (lock_line() < 0) return 1;
   if (open_line() < 0) {
     saved = errno;

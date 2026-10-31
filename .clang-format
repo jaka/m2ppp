@@ -1,0 +1,11 @@
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortFunctionsOnASingleLine: false
+AllowShortLoopsOnASingleLine: true
+IndentCaseLabels: true
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true
+  AfterControlStatement: false
+  BeforeElse: true
+PointerAlignment: Right
+ColumnLimit: 100
